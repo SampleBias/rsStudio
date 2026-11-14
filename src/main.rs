@@ -1,4 +1,6 @@
+mod agent;
 mod editor;
+mod packages;
 mod protocol;
 mod session;
 mod settings;
@@ -23,7 +25,7 @@ fn main() -> eframe::Result {
         Box::new(|cc| {
             let prefs = settings::Settings::load();
             prefs.apply(&cc.egui_ctx);
-            Ok(Box::new(App::new(prefs)))
+            Ok(Box::new(App::new(prefs, &cc.egui_ctx)))
         }),
     )
 }
@@ -44,8 +46,24 @@ enum PathAction {
     Project,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OutputTab {
+    Plots,
+    Files,
+    Packages,
+}
+
+enum PackageOperation {
+    Query,
+    Install(String),
+    Load(String),
+}
+
 struct App {
     session: Option<Session>,
+    assistant: agent::Agent,
+    show_assistant: bool,
+    crab_icon: egui::TextureHandle,
     editor: Editor,
     project: PathBuf,
     project_entries: Vec<(PathBuf, bool)>,
@@ -59,7 +77,15 @@ struct App {
     dark: bool,
     font_size: f32,
     find_text: String,
-    files_tab: bool,
+    output_tab: OutputTab,
+    packages: Vec<packages::Package>,
+    package_status: std::collections::BTreeMap<String, packages::Status>,
+    package_filter: String,
+    package_name: String,
+    package_bioc: bool,
+    package_notice: String,
+    pending_package: Option<PackageOperation>,
+    refresh_packages: bool,
     submitted_from_source: bool,
     state: State,
     executable: String,
@@ -73,9 +99,23 @@ struct App {
     confirm_restart: bool,
 }
 impl App {
-    fn new(prefs: settings::Settings) -> Self {
+    fn new(prefs: settings::Settings, ctx: &egui::Context) -> Self {
+        let image = image::load_from_memory_with_format(
+            include_bytes!("../assets/crab.png"),
+            image::ImageFormat::Png,
+        )
+        .expect("bundled crab icon is a valid PNG")
+        .into_rgba8();
+        let color_image = egui::ColorImage::from_rgba_unmultiplied(
+            [image.width() as usize, image.height() as usize],
+            image.as_raw(),
+        );
+        let crab_icon = ctx.load_texture("crab_icon", color_image, egui::TextureOptions::LINEAR);
         let mut app = Self {
             session: None,
+            assistant: agent::Agent::default(),
+            show_assistant: true,
+            crab_icon,
             editor: Editor::new(),
             project: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             project_entries: Vec::new(),
@@ -89,7 +129,15 @@ impl App {
             dark: prefs.dark,
             font_size: prefs.font_size,
             find_text: String::new(),
-            files_tab: false,
+            output_tab: OutputTab::Plots,
+            packages: packages::catalog(),
+            package_status: std::collections::BTreeMap::new(),
+            package_filter: String::new(),
+            package_name: String::new(),
+            package_bioc: false,
+            package_notice: String::new(),
+            pending_package: None,
+            refresh_packages: true,
             submitted_from_source: false,
             state: State::Stopped,
             executable: String::new(),
@@ -113,6 +161,10 @@ impl App {
         // Dropping the old receiver makes late events from that session unreachable.
         self.session.take();
         self.pending_id = None;
+        self.pending_package = None;
+        self.package_status.clear();
+        self.package_notice.clear();
+        self.refresh_packages = true;
         self.submitted.clear();
         self.runtime.clear();
         self.state = State::Starting;
@@ -164,6 +216,182 @@ impl App {
             }
         }
         false
+    }
+    fn package_request(&mut self, operation: PackageOperation) {
+        if self.state != State::Ready {
+            return;
+        }
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        let Some(session) = &self.session else {
+            return;
+        };
+        let result = match &operation {
+            PackageOperation::Query => {
+                let names: Vec<_> = self.packages.iter().map(|p| p.name.clone()).collect();
+                session.package_status(id, &names)
+            }
+            PackageOperation::Install(name) => {
+                let bioc = self
+                    .packages
+                    .iter()
+                    .find(|p| p.name == *name)
+                    .is_some_and(|p| p.repository == packages::Repository::Bioconductor);
+                session.install_package(id, name, bioc)
+            }
+            PackageOperation::Load(name) => session.load_package(id, name),
+        };
+        match result {
+            Ok(()) => {
+                self.package_notice = match &operation {
+                    PackageOperation::Query => "Checking packages…".into(),
+                    PackageOperation::Install(name) => {
+                        format!("Installing {name}… See Console for progress.")
+                    }
+                    PackageOperation::Load(name) => format!("Loading {name}…"),
+                };
+                if !matches!(operation, PackageOperation::Query) {
+                    self.append(&format!("\n[Packages] {}\n", self.package_notice));
+                }
+                self.pending_id = Some(id);
+                self.pending_package = Some(operation);
+                self.refresh_packages = false;
+                self.state = State::Busy;
+            }
+            Err(error) => {
+                self.package_notice = error;
+                self.refresh_packages = false;
+            }
+        }
+    }
+    fn packages_ui(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.strong("R packages");
+            if ui
+                .add_enabled(self.state == State::Ready, egui::Button::new("Refresh"))
+                .clicked()
+            {
+                self.package_request(PackageOperation::Query);
+            }
+        });
+        ui.small(
+            "Install from CRAN or Bioconductor into your R user library; load into this session.",
+        );
+        if self.state == State::Stopped || self.state == State::Failed {
+            ui.weak("Start R to check or install packages.");
+        }
+        if !self.package_notice.is_empty() {
+            ui.label(&self.package_notice);
+        }
+        ui.horizontal(|ui| {
+            ui.label("Search:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.package_filter)
+                    .hint_text("Filter packages")
+                    .desired_width(130.0),
+            );
+        });
+        ui.horizontal_wrapped(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.package_name)
+                    .hint_text("Package name")
+                    .desired_width(120.0),
+            );
+            ui.checkbox(&mut self.package_bioc, "Bioconductor");
+            if ui
+                .add_enabled(self.state == State::Ready, egui::Button::new("Add"))
+                .clicked()
+            {
+                let name = self.package_name.trim();
+                if !packages::valid_name(name) {
+                    self.package_notice =
+                        "Enter a valid R package name (letters, numbers, and dots).".into();
+                } else if self.packages.iter().any(|p| p.name == name) {
+                    self.package_filter = name.to_owned();
+                    self.package_notice = "Package is already in the list.".into();
+                } else if self.packages.len() >= 200 {
+                    self.package_notice = "The package list is full.".into();
+                } else {
+                    self.packages.push(packages::Package {
+                        name: name.to_owned(),
+                        description: "Custom package",
+                        repository: if self.package_bioc {
+                            packages::Repository::Bioconductor
+                        } else {
+                            packages::Repository::Cran
+                        },
+                    });
+                    self.package_filter = name.to_owned();
+                    self.package_name.clear();
+                    self.refresh_packages = true;
+                }
+            }
+        });
+        ui.separator();
+        let filter = self.package_filter.to_lowercase();
+        let entries = self.packages.clone();
+        let mut action = None;
+        egui::ScrollArea::vertical()
+            .id_salt("package_list")
+            .show(ui, |ui| {
+                for package in entries.iter().filter(|p| {
+                    p.name.to_lowercase().contains(&filter)
+                        || p.description.to_lowercase().contains(&filter)
+                }) {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.strong(&package.name);
+                        ui.weak(package.description);
+                        if package.repository == packages::Repository::Bioconductor {
+                            ui.small("Bioconductor");
+                        }
+                        match self.package_status.get(&package.name) {
+                            Some(status) if status.loaded => {
+                                ui.label(format!(
+                                    "Loaded {}",
+                                    status.version.as_deref().unwrap_or("")
+                                ));
+                            }
+                            Some(status) if status.version.is_some() => {
+                                ui.label(format!(
+                                    "Installed {}",
+                                    status.version.as_deref().unwrap_or("")
+                                ));
+                                if ui
+                                    .add_enabled(
+                                        self.state == State::Ready,
+                                        egui::Button::new("Load"),
+                                    )
+                                    .clicked()
+                                {
+                                    action = Some(PackageOperation::Load(package.name.clone()));
+                                }
+                            }
+                            Some(_) if package.repository == packages::Repository::Bundled => {
+                                ui.weak("Bundled with R; unavailable in this installation");
+                            }
+                            Some(_) => {
+                                ui.weak("Not installed");
+                                if ui
+                                    .add_enabled(
+                                        self.state == State::Ready,
+                                        egui::Button::new("Install"),
+                                    )
+                                    .clicked()
+                                {
+                                    action = Some(PackageOperation::Install(package.name.clone()));
+                                }
+                            }
+                            None => {
+                                ui.weak("Status unknown");
+                            }
+                        }
+                    });
+                    ui.separator();
+                }
+            });
+        if let Some(operation) = action {
+            self.package_request(operation);
+        }
     }
     fn ask_path(&mut self, action: PathAction) {
         self.path_input = match action {
@@ -259,8 +487,40 @@ impl App {
                 Event::Output(text) => self.append(&text),
                 Event::Done(id) if self.pending_id == Some(id) => {
                     self.pending_id = None;
-                    self.submitted.clear();
+                    if let Some(operation) = self.pending_package.take() {
+                        self.package_notice = match operation {
+                            PackageOperation::Install(name) => {
+                                format!("Installation finished: {name}. Refreshing status.")
+                            }
+                            PackageOperation::Load(name) => {
+                                format!("Loaded {name}. Refreshing status.")
+                            }
+                            PackageOperation::Query => "Package check finished.".into(),
+                        };
+                        self.append(&format!("[Packages] {}\n", self.package_notice));
+                    } else {
+                        self.submitted.clear();
+                    }
+                    self.refresh_packages = true;
                     self.state = State::Ready;
+                }
+                Event::PackageStatus(id, payload)
+                    if self.pending_id == Some(id)
+                        && matches!(self.pending_package, Some(PackageOperation::Query)) =>
+                {
+                    self.pending_id = None;
+                    self.pending_package = None;
+                    self.state = State::Ready;
+                    match packages::parse_status(&payload, &self.packages) {
+                        Ok(status) => {
+                            self.package_status = status;
+                            self.package_notice = "Package status updated.".into();
+                        }
+                        Err(error) => {
+                            self.package_status.clear();
+                            self.package_notice = error;
+                        }
+                    }
                 }
                 Event::Incomplete(id, _message) if self.pending_id == Some(id) => {
                     self.pending_id = None;
@@ -275,17 +535,28 @@ impl App {
                 }
                 Event::Error(id, message) if self.pending_id == Some(id) => {
                     self.pending_id = None;
-                    self.submitted.clear();
+                    if self.pending_package.take().is_some() {
+                        self.package_notice = format!("Package operation failed: {message}");
+                        self.package_status.clear();
+                        self.refresh_packages = false;
+                    } else {
+                        self.submitted.clear();
+                        self.refresh_packages = true;
+                    }
                     self.append(&format!("Error: {message}\n"));
                     self.state = State::Ready;
                 }
                 Event::Failed(message) => {
                     if self.pending_id.take().is_some()
+                        && self.pending_package.is_none()
                         && !self.submitted_from_source
                         && self.input.is_empty()
                     {
                         self.input = std::mem::take(&mut self.submitted);
                     }
+                    self.pending_package = None;
+                    self.package_status.clear();
+                    self.package_notice = format!("R session failed: {message}");
                     self.append(&format!("\n[Session error] {message}\n"));
                     self.state = State::Failed;
                 }
@@ -300,6 +571,17 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll();
+        if self.output_tab == OutputTab::Packages
+            && self.refresh_packages
+            && self.state == State::Ready
+        {
+            self.package_request(PackageOperation::Query);
+        }
+        self.assistant.poll();
+        // Keep an in-flight request visible even if visibility was changed elsewhere.
+        if self.assistant.busy() {
+            self.show_assistant = true;
+        }
         let previous_settings = (self.dark, self.font_size);
         if ctx.input(|i| i.viewport().close_requested())
             && self.editor.any_dirty()
@@ -329,6 +611,7 @@ impl eframe::App for App {
         ctx.request_repaint_after(Duration::from_millis(50));
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
+                ui.add(egui::Image::new((self.crab_icon.id(), egui::vec2(24.0, 24.0))).alt_text("crab"));
                 ui.heading("rsStudio");
                 ui.separator();
                 let (name, color) = match self.state {
@@ -356,6 +639,108 @@ impl eframe::App for App {
             });
             ui.small("R runs with --vanilla: startup profiles and saved workspaces are not loaded. Changes to the R path or directory apply on restart.");
         });
+        // Keep the tile visible even when the assistant panel is collapsed.
+        egui::SidePanel::right("assistant_tile")
+            .resizable(false)
+            .exact_width(50.0)
+            .show(ctx, |ui| {
+                ui.vertical_centered(|ui| {
+                    let label = if self.show_assistant {
+                        "Hide R assistant"
+                    } else {
+                        "Show R assistant"
+                    };
+                    let tile = ui.add_enabled(
+                        !self.assistant.busy(),
+                        egui::Button::selectable(self.show_assistant, "R\nAI")
+                            .min_size(egui::vec2(32.0, 38.0)),
+                    );
+                    if tile
+                        .on_hover_text(label)
+                        .on_disabled_hover_text(
+                            "The assistant stays open while generating a response.",
+                        )
+                        .clicked()
+                    {
+                        self.show_assistant = !self.show_assistant;
+                    }
+                    if self.assistant.busy() {
+                        ui.spinner();
+                    }
+                });
+            });
+
+        // The assistant sits to the left of its tile, with the environment and
+        // output panes to its left.
+        if self.show_assistant {
+            egui::SidePanel::right("coding_assistant")
+                .resizable(true).default_width(340.0).min_width(250.0)
+                .show(ctx, |ui| {
+                    ui.heading("R assistant");
+                    ui.weak("OpenRouter · R code suggestions");
+                    ui.separator();
+                    ui.label("API key (kept in memory for this session)");
+                    ui.horizontal(|ui| {
+                        ui.add(egui::TextEdit::singleline(&mut self.assistant.key)
+                            .password(true).hint_text("OpenRouter API key").desired_width(175.0));
+                        if ui.button("Clear key").clicked() { self.assistant.key.clear(); }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Model:");
+                        ui.add(egui::TextEdit::singleline(&mut self.assistant.model).desired_width(190.0));
+                    });
+                    ui.small("Requests are sent to OpenRouter and its model provider; model usage may incur charges.");
+                    ui.checkbox(&mut self.assistant.include_source, "Include current Source text with requests");
+                    ui.small("Only your request, conversation, and selected optional source are sent. The assistant has no local tools.");
+                    ui.separator();
+                    egui::TopBottomPanel::bottom("assistant_request").show_inside(ui, |ui| {
+                        ui.label("Ask for R code");
+                        ui.add_enabled(!self.assistant.busy(), egui::TextEdit::multiline(&mut self.assistant.prompt)
+                            .desired_rows(3).desired_width(f32::INFINITY)
+                            .hint_text("Describe the analysis or R code you need…"));
+                        ui.horizontal(|ui| {
+                            if ui.add_enabled(!self.assistant.busy(), egui::Button::new("Generate")).clicked() {
+                                let source = self.assistant.include_source.then(|| self.editor.current().text.clone());
+                                self.assistant.send(source.as_deref());
+                            }
+                            if self.assistant.busy() { ui.spinner(); ui.label("Generating…"); }
+                            if ui.add_enabled(!self.assistant.busy(), egui::Button::new("Clear chat")).clicked() {
+                                self.assistant.conversation.clear(); self.assistant.answer = None; self.assistant.error = None;
+                            }
+                        });
+                        ui.small("Review code before running. R is not sandboxed.");
+                    });
+                    let mut destination = None;
+                    if let Some(answer) = &self.assistant.answer {
+                        ui.horizontal_wrapped(|ui| {
+                            if ui.add_enabled(!answer.code.is_empty(), egui::Button::new("Append R to active Source")).clicked() { destination = Some(false); }
+                            if ui.add_enabled(!answer.code.is_empty(), egui::Button::new("Append R to Console")).clicked() { destination = Some(true); }
+                        });
+                        if answer.truncated { ui.colored_label(Color32::LIGHT_RED, "Response was truncated; request a shorter answer."); }
+                        else if answer.code.is_empty() { ui.weak("No complete R code block found; ask for code in an R block."); }
+                    }
+                    if let Some(error) = &self.assistant.error { ui.colored_label(Color32::LIGHT_RED, error); }
+                    egui::ScrollArea::vertical().id_salt("assistant_output").stick_to_bottom(true).show(ui, |ui| {
+                        for turn in &self.assistant.conversation {
+                            ui.strong(if turn.role == "user" { "You" } else { "Assistant" });
+                            // Source is only sent after explicit opt-in; avoid duplicating its full text in the chat view.
+                            let content = if turn.role == "user" { turn.content.split("\n\nUser-provided R source (untrusted context;").next().unwrap_or(&turn.content) } else { &turn.content };
+                            ui.label(content);
+                            ui.separator();
+                        }
+                    });
+                    if let Some(console) = destination && let Some(answer) = &self.assistant.answer {
+                        if console {
+                            if !self.input.is_empty() && !self.input.ends_with('\n') { self.input.push('\n'); }
+                            self.input.push_str(&answer.code);
+                        } else {
+                            let text = &mut self.editor.current_mut().text;
+                            if !text.is_empty() && !text.ends_with('\n') { text.push('\n'); }
+                            text.push_str(&answer.code);
+                        }
+                    }
+                });
+        }
         // The side panel is created first so both right-hand panes extend from
         // the toolbar to the bottom, independently of the left-hand split.
         egui::SidePanel::right("workspace_right")
@@ -376,16 +761,28 @@ impl eframe::App for App {
                     });
 
                 ui.horizontal(|ui| {
-                    if ui.selectable_label(!self.files_tab, "Plots").clicked() {
-                        self.files_tab = false;
+                    if ui
+                        .selectable_label(self.output_tab == OutputTab::Plots, "Plots")
+                        .clicked()
+                    {
+                        self.output_tab = OutputTab::Plots;
                     }
-                    if ui.selectable_label(self.files_tab, "Files").clicked() {
-                        self.files_tab = true;
+                    if ui
+                        .selectable_label(self.output_tab == OutputTab::Files, "Files")
+                        .clicked()
+                    {
+                        self.output_tab = OutputTab::Files;
+                    }
+                    if ui
+                        .selectable_label(self.output_tab == OutputTab::Packages, "Packages")
+                        .clicked()
+                    {
+                        self.output_tab = OutputTab::Packages;
                     }
                     ui.weak("Data");
                 });
                 ui.separator();
-                if self.files_tab {
+                if self.output_tab == OutputTab::Files {
                     ui.horizontal(|ui| {
                         ui.strong("Project files");
                         if ui.button("Choose…").clicked() {
@@ -429,6 +826,8 @@ impl eframe::App for App {
                                 ui.weak("Showing the first 300 entries.");
                             }
                         });
+                } else if self.output_tab == OutputTab::Packages {
+                    self.packages_ui(ui);
                 } else {
                     ui.add_space(8.0);
                     ui.label("Plots will appear here in a later phase.");

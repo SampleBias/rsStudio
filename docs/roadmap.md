@@ -22,7 +22,7 @@ On a clean supported Linux machine, install rsStudio and R using documented step
 
 ## Explicitly deferred
 
-Remote R, multiple simultaneous sessions, notebooks/Quarto, debugging, language-server intelligence, package installation UI, version-control integration, database connections, and R runtime auto-download are outside the MVP. A minimal editor is not expected to match every mature IDE feature. Full terminal-style input and advanced R interaction require the feasibility decision in [architecture](architecture.md#console-compatibility-boundary).
+Remote R, multiple simultaneous sessions, notebooks/Quarto, debugging, language-server intelligence, version-control integration, database connections, and R runtime auto-download are outside the MVP. A minimal editor is not expected to match every mature IDE feature. Full terminal-style input and advanced R interaction require the feasibility decision in [architecture](architecture.md#console-compatibility-boundary).
 
 ## Decisions to close
 

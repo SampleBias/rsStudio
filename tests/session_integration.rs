@@ -1,3 +1,6 @@
+#[allow(dead_code)]
+#[path = "../src/packages.rs"]
+mod packages;
 #[path = "../src/protocol.rs"]
 mod protocol;
 #[path = "../src/session.rs"]
@@ -67,6 +70,10 @@ while True:
  if h is None: break
  b=read(struct.unpack('>I',h)[0]); kind, ident, value=b.decode().split('\t',2)
  if kind == 'SHUTDOWN': break
+ if kind == 'PACKAGES':
+  send('STATUS',ident,'\n'.join(name + ('\t4.4.0\t1' if name == 'stats' else '\t-\t0') for name in value.split('\n'))); continue
+ if kind in ('INSTALL','LOAD'):
+  send('DONE',ident); continue
  if value == 'x <- 41': x=41
  elif value == 'x + 1': print('[1] '+str(x+1) if x is not None else 'missing',flush=True)
  elif value == 'error': send('ERROR',ident,'fake failure'); continue
@@ -126,6 +133,27 @@ fn persistent_session_recovers_and_restarts() {
     let next = Session::start(executable.display().to_string(), std::env::temp_dir());
     wait_for(&next, |e| matches!(e, Event::Ready { .. }));
     drop(next);
+}
+
+#[test]
+fn package_requests_validate_names_and_route_responses() {
+    if !network_available() {
+        return;
+    }
+    let executable = fake_r();
+    let session = Session::start(executable.display().to_string(), std::env::temp_dir());
+    wait_for(&session, |e| matches!(e, Event::Ready { .. }));
+    assert!(session.install_package(1, "dplyr;quit()", false).is_err());
+    let names = vec!["stats".to_owned(), "dplyr".to_owned()];
+    session.package_status(2, &names).unwrap();
+    let (event, _) = wait_for(&session, |e| matches!(e, Event::PackageStatus(2, _)));
+    assert!(
+        matches!(event, Event::PackageStatus(_, payload) if payload.contains("stats\t4.4.0\t1"))
+    );
+    session.install_package(3, "DESeq2", true).unwrap();
+    wait_for(&session, |e| matches!(e, Event::Done(3)));
+    session.load_package(4, "stats").unwrap();
+    wait_for(&session, |e| matches!(e, Event::Done(4)));
 }
 
 #[test]
@@ -222,4 +250,24 @@ fn real_r_persistent_session() {
     wait_for(&session, |e| matches!(e, Event::Error(4, _)));
     session.evaluate(5, "x + 1".into()).unwrap();
     wait_for(&session, |e| matches!(e, Event::Done(5)));
+    let names = vec![
+        "stats".to_owned(),
+        "rsStudioDefinitelyMissingPackage".to_owned(),
+    ];
+    session.package_status(6, &names).unwrap();
+    let (event, _) = wait_for(&session, |e| matches!(e, Event::PackageStatus(6, _)));
+    if let Event::PackageStatus(_, payload) = event {
+        assert!(
+            payload
+                .lines()
+                .any(|row| row.starts_with("stats\t") && row.ends_with("\t1")),
+            "{payload}"
+        );
+        assert!(
+            payload.contains("rsStudioDefinitelyMissingPackage\t-\t0"),
+            "{payload}"
+        );
+    }
+    session.load_package(7, "stats").unwrap();
+    wait_for(&session, |e| matches!(e, Event::Done(7)));
 }

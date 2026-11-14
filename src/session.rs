@@ -1,3 +1,4 @@
+use crate::packages::valid_name;
 use crate::protocol::{self, Message};
 use std::fs::{self, File};
 use std::io::{self, Read};
@@ -17,6 +18,7 @@ pub enum Event {
     Ready { executable: String, version: String },
     Output(String),
     Done(u64),
+    PackageStatus(u64, String),
     Incomplete(u64, String),
     Error(u64, String),
     Failed(String),
@@ -24,7 +26,7 @@ pub enum Event {
 }
 #[derive(Debug)]
 enum Request {
-    Evaluate(u64, String),
+    Command(u64, &'static str, String),
     Stop,
 }
 
@@ -55,8 +57,35 @@ impl Session {
             return Err("Input exceeds the 1 MiB limit or contains a NUL character.".into());
         }
         self.commands
-            .try_send(Request::Evaluate(id, text))
+            .try_send(Request::Command(id, "EVAL", text))
             .map_err(|e| format!("Cannot submit command: {e}"))
+    }
+    pub fn package_status(&self, id: u64, names: &[String]) -> Result<(), String> {
+        if names.is_empty() || names.len() > 200 || names.iter().any(|name| !valid_name(name)) {
+            return Err("Invalid package list".into());
+        }
+        self.send_package(id, "PACKAGES", names.join("\n"))
+    }
+    pub fn install_package(&self, id: u64, name: &str, bioconductor: bool) -> Result<(), String> {
+        if !valid_name(name) {
+            return Err("Invalid package name".into());
+        }
+        self.send_package(
+            id,
+            "INSTALL",
+            format!("{}\t{name}", if bioconductor { "BIOC" } else { "CRAN" }),
+        )
+    }
+    pub fn load_package(&self, id: u64, name: &str) -> Result<(), String> {
+        if !valid_name(name) {
+            return Err("Invalid package name".into());
+        }
+        self.send_package(id, "LOAD", name.to_owned())
+    }
+    fn send_package(&self, id: u64, kind: &'static str, payload: String) -> Result<(), String> {
+        self.commands
+            .try_send(Request::Command(id, kind, payload))
+            .map_err(|e| format!("Cannot send package request: {e}"))
     }
     pub fn poll(&self) -> Vec<Event> {
         self.events
@@ -311,27 +340,32 @@ fn connected_loop(
                 }
                 return Ok(());
             }
-            Ok(Request::Evaluate(id, text)) => {
+            Ok(Request::Command(id, kind, text)) => {
                 if pending.is_some() {
                     let _ = events.send(Event::Error(id, "R is already busy".into()));
                 } else {
-                    protocol::write_message(&mut writer, "EVAL", id, &text)?;
-                    pending = Some(id);
+                    protocol::write_message(&mut writer, kind, id, &text)?;
+                    pending = Some((id, kind));
                 }
             }
             Err(TryRecvError::Empty) => {}
         }
         match rx.try_recv() {
             Ok(Ok(msg)) => {
-                if pending != Some(msg.id) {
+                if pending.map(|(id, _)| id) != Some(msg.id) {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "Unexpected R response ID",
                     ));
                 }
                 let event = match msg.kind.as_str() {
-                    "DONE" => Event::Done(msg.id),
-                    "INCOMPLETE" => Event::Incomplete(msg.id, msg.payload),
+                    "STATUS" if pending == Some((msg.id, "PACKAGES")) => {
+                        Event::PackageStatus(msg.id, msg.payload)
+                    }
+                    "DONE" if pending != Some((msg.id, "PACKAGES")) => Event::Done(msg.id),
+                    "INCOMPLETE" if pending == Some((msg.id, "EVAL")) => {
+                        Event::Incomplete(msg.id, msg.payload)
+                    }
                     "ERROR" => Event::Error(msg.id, msg.payload),
                     _ => {
                         return Err(io::Error::new(
