@@ -9,8 +9,9 @@ rsStudio is a Linux-first, Rust-native IDE for R. It uses egui for the interface
 ## Features
 
 - Edit and run R scripts in a persistent R session.
+- View R plots in the Plots pane, browse plot history, zoom, and export PNG images.
 - Install and load common CRAN and Bioconductor packages.
-- Generate R code with the optional OpenRouter-powered R-gentic Assist; review and run suggestions yourself.
+- Use the OpenRouter-powered R-gentic Assist to inspect selected R environment objects, interpret pasted images, and generate R code; review and run suggestions yourself.
 - Choose a light or dark theme.
 
 ## Getting started
@@ -22,9 +23,9 @@ R --version
 cargo run
 ```
 
-Select **Packages** to manage R packages. To use the assistant, open **R-gentic Assist** using the arrow on the right and enter an OpenRouter API key. R code runs with your normal account permissions.
+Select **Packages** to manage R packages. Import CSV/TSV files from **Environment**, and select objects there to let the assistant inspect them. To use the assistant, open **R-gentic Assist** using the arrow on the right and enter an OpenRouter API key. Its default model is paid; requests can incur charges. Selected data previews and pasted images are sent to the model provider. R code runs with your normal account permissions.
 
-See the [user guide](docs/user-guide.md) for setup details and the [development plan](docs/README.md) for planned features. Environment inspection, data viewing, and plots are still in development.
+See the [user guide](docs/user-guide.md) for setup details and the [development plan](docs/README.md) for planned features. Data viewing is still in development.
 
 ## License
 

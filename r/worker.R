@@ -3,7 +3,8 @@
 local({
 port <- as.integer(Sys.getenv("RSSTUDIO_PORT"))
 secret <- Sys.getenv("RSSTUDIO_SECRET")
-Sys.unsetenv(c("RSSTUDIO_PORT", "RSSTUDIO_SECRET"))
+plot_dir <- Sys.getenv("RSSTUDIO_PLOT_DIR")
+Sys.unsetenv(c("RSSTUDIO_PORT", "RSSTUDIO_SECRET", "RSSTUDIO_PLOT_DIR"))
 con <- socketConnection(host = "127.0.0.1", port = port, open = "r+b", blocking = TRUE, timeout = 86400)
 max_frame <- 1024L * 1024L
 read_exact <- function(n) {
@@ -93,11 +94,143 @@ install_one <- function(name, repo) {
            error = function(e) stop("Installed package is invalid; see console output: ", conditionMessage(e)))
   cat("Installed", name, "successfully.\n")
 }
+
+# Encode the bounded environment snapshot without requiring an R package.
+json_string <- function(value) {
+  value <- if (length(value) == 0L || is.na(value[1L])) "NA" else enc2utf8(as.character(value[1L]))
+  points <- utf8ToInt(value)
+  escaped <- vapply(points, function(ch) {
+    if (ch == 34L) return('\\"')
+    if (ch == 92L) return('\\\\')
+    if (ch < 32L) return(sprintf("\\u%04x", ch))
+    intToUtf8(ch)
+  }, character(1L))
+  paste0('"', paste0(escaped, collapse = ""), '"')
+}
+json_array <- function(values) paste0("[", paste0(values, collapse = ","), "]")
+clip_text <- function(x) substr(enc2utf8(as.character(x)), 1L, 60L)
+environment_snapshot <- function() {
+  names <- head(ls(envir = .GlobalEnv, all.names = FALSE), 20L)
+  entries <- lapply(names, function(name) tryCatch({
+    if (bindingIsActive(name, .GlobalEnv)) return(NULL)
+    x <- get(name, envir = .GlobalEnv, inherits = FALSE)
+    cls <- paste(head(class(x), 3L), collapse = "/")
+    columns <- list()
+    n <- 0L
+    if (is.data.frame(x) || is.matrix(x)) {
+      n <- nrow(x)
+      count <- min(ncol(x), 20L)
+      if (count) for (i in seq_len(count)) {
+        col <- if (is.data.frame(x)) x[[i]] else x[, i]
+        col_name <- colnames(x)[i]
+        if (is.null(col_name) || is.na(col_name)) col_name <- paste0("V", i)
+        columns[[length(columns) + 1L]] <- list(name = col_name, value = col)
+      }
+    } else if (is.atomic(x) && is.null(dim(x))) {
+      n <- length(x)
+      columns <- list(list(name = name, value = x))
+    }
+    fields <- vapply(columns, function(col) {
+      value <- col$value
+      sample <- head(value, 10000L)
+      missing <- if (is.atomic(sample)) sum(is.na(sample)) else NA_integer_
+      example <- head(value, 5L)
+      preview <- if (is.atomic(example)) vapply(example, function(v) json_string(clip_text(v)), character(1L)) else character()
+      paste0('{"name":', json_string(clip_text(col$name)), ',"type":', json_string(paste(head(class(value), 3L), collapse = "/")),
+             ',"missing_in_sample":', if (is.na(missing)) "null" else missing,
+             ',"sample_size":', length(sample), ',"preview":', json_array(preview), '}')
+    }, character(1L))
+    paste0('{"name":', json_string(name), ',"class":', json_string(cls), ',"length":', n,
+           ',"columns":', json_array(fields), '}')
+  }, error = function(e) NULL))
+  json_array(unlist(entries, use.names = FALSE))
+}
+
+# Keep an R graphics device alive across evaluations, so commands such as
+# points() and lines() can add to an existing plot. Render snapshots through a
+# second device; all generated files live in the supervisor's private directory.
+plot_device <- NA_integer_
+plot_page <- 0L
+plot_sequence <- 0L
+plot_started <- FALSE
+plot_capturing <- FALSE
+plot_last_page <- NA_integer_
+plot_last_record <- NULL
+plot_request <- NULL
+open_plot_device <- function(...) {
+  grDevices::png(file.path(plot_dir, "working.png"), width = 960L, height = 720L,
+                 res = 96L, type = if (capabilities("cairo")) "cairo" else getOption("bitmapType"))
+  grDevices::dev.control(displaylist = "enable")
+  plot_device <<- as.integer(grDevices::dev.cur())
+  plot_page <<- plot_page + 1L
+  plot_started <<- FALSE
+}
+options(device = open_plot_device)
+is_plot_device <- function() {
+  if (!is.na(plot_device) && !(plot_device %in% grDevices::dev.list())) {
+    plot_device <<- NA_integer_
+    plot_started <<- FALSE
+  }
+  !is.na(plot_device) && as.integer(grDevices::dev.cur()) == plot_device
+}
+capture_plot <- function() {
+  if (plot_capturing || is.null(plot_request) || !plot_started || !is_plot_device()) return(invisible(NULL))
+  plot_capturing <<- TRUE
+  on.exit(plot_capturing <<- FALSE, add = TRUE)
+  recording <- grDevices::recordPlot()
+  snapshot <- serialize(recording, NULL)
+  if (identical(plot_page, plot_last_page) && identical(snapshot, plot_last_record)) return(invisible(NULL))
+  plot_sequence <<- plot_sequence + 1L
+  filename <- sprintf("plot-%08d.png", plot_sequence)
+  previous <- grDevices::dev.cur()
+  grDevices::png(file.path(plot_dir, filename), width = 960L, height = 720L,
+                 res = 96L, type = if (capabilities("cairo")) "cairo" else getOption("bitmapType"))
+  render_device <- grDevices::dev.cur()
+  tryCatch(grDevices::replayPlot(recording), finally = {
+    grDevices::dev.off(render_device)
+    if (previous %in% grDevices::dev.list()) grDevices::dev.set(previous)
+  })
+  # Some devices do not create an image for a blank page.
+  if (!file.exists(file.path(plot_dir, filename))) return(invisible(NULL))
+  send_message("PLOT", plot_request, paste(plot_page, filename, sep = "\t"))
+  plot_last_page <<- plot_page
+  plot_last_record <<- snapshot
+  invisible(NULL)
+}
+before_base_page <- function() {
+  if (plot_capturing || !is_plot_device() || !plot_started) return(invisible(NULL))
+  mfg <- graphics::par("mfg")
+  if (!isTRUE(graphics::par("new")) && mfg[1L] == mfg[3L] && mfg[2L] == mfg[4L]) {
+    try(capture_plot(), silent = TRUE)
+    plot_page <<- plot_page + 1L
+    plot_started <<- FALSE
+  }
+}
+before_grid_page <- function() {
+  if (plot_capturing || !is_plot_device() || !plot_started) return(invisible(NULL))
+  try(capture_plot(), silent = TRUE)
+  plot_page <<- plot_page + 1L
+  plot_started <<- FALSE
+}
+after_plot_page <- function() {
+  if (!plot_capturing && is_plot_device()) plot_started <<- TRUE
+}
+setHook("before.plot.new", before_base_page, action = "append")
+setHook("plot.new", after_plot_page, action = "append")
+setHook("before.grid.newpage", before_grid_page, action = "append")
+setHook("grid.newpage", after_plot_page, action = "append")
 send_message("HELLO", "0", paste0("1:", secret))
 rm(secret)
 repeat {
   request <- tryCatch(read_message(), error = function(e) NULL)
   if (is.null(request) || identical(request$kind, "SHUTDOWN")) break
+  if (identical(request$kind, "ENVIRONMENT")) {
+    result <- tryCatch(environment_snapshot(), error = identity)
+    if (inherits(result, "error")) send_message("ERROR", request$id, conditionMessage(result))
+    else if (nchar(result, type = "bytes") > max_frame - 100L) send_message("ERROR", request$id, "Environment summary exceeds size limit")
+    else send_message("ENVIRONMENT", request$id, result)
+    next
+  }
   if (request$kind %in% c("PACKAGES", "INSTALL", "LOAD")) {
     result <- tryCatch({
       if (identical(request$kind, "PACKAGES")) {
@@ -134,14 +267,18 @@ repeat {
     next
   }
   err <- tryCatch({
+    plot_request <- request$id
     for (expression in parsed) {
       result <- withVisible(eval(expression, envir = .GlobalEnv))
       if (result$visible) print(result$value)
+      tryCatch(capture_plot(), error = function(e) cat("[Plot error]", conditionMessage(e), "\n", file = stderr()))
       flush(stdout())
       flush(stderr())
     }
     NULL
   }, error = identity)
+  tryCatch(capture_plot(), error = function(e) cat("[Plot error]", conditionMessage(e), "\n", file = stderr()))
+  plot_request <- NULL
   if (inherits(err, "error")) send_message("ERROR", request$id, conditionMessage(err))
   else send_message("DONE", request$id)
 }

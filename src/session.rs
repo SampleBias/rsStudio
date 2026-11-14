@@ -19,6 +19,9 @@ pub enum Event {
     Output(String),
     Done(u64),
     PackageStatus(u64, String),
+    Environment(u64, String),
+    Plot { page: u64, png: Vec<u8> },
+    PlotError(String),
     Incomplete(u64, String),
     Error(u64, String),
     Failed(String),
@@ -65,6 +68,9 @@ impl Session {
             return Err("Invalid package list".into());
         }
         self.send_package(id, "PACKAGES", names.join("\n"))
+    }
+    pub fn environment(&self, id: u64) -> Result<(), String> {
+        self.send_package(id, "ENVIRONMENT", String::new())
     }
     pub fn install_package(&self, id: u64, name: &str, bioconductor: bool) -> Result<(), String> {
         if !valid_name(name) {
@@ -169,6 +175,7 @@ fn run(
         .arg(script)
         .env("RSSTUDIO_PORT", port.to_string())
         .env("RSSTUDIO_SECRET", &secret)
+        .env("RSSTUDIO_PLOT_DIR", &scratch.0)
         .env("LC_MESSAGES", "C")
         .current_dir(directory)
         .stdin(Stdio::null())
@@ -187,11 +194,11 @@ fn run(
     let result = connected_loop(
         &listener,
         &secret,
-        &executable,
-        &version,
+        (&executable, &version),
         &mut child,
         requests,
         events,
+        &scratch.0,
     );
     terminate(&mut child);
     result
@@ -260,11 +267,11 @@ fn version(executable: &str, requests: &Receiver<Request>) -> io::Result<String>
 fn connected_loop(
     listener: &TcpListener,
     secret: &str,
-    executable: &str,
-    version: &str,
+    runtime: (&str, &str),
     child: &mut Child,
     requests: &Receiver<Request>,
     events: &SyncSender<Event>,
+    plot_dir: &std::path::Path,
 ) -> io::Result<()> {
     let started = Instant::now();
     let stream = loop {
@@ -318,8 +325,8 @@ fn connected_loop(
         }
     });
     let _ = events.send(Event::Ready {
-        executable: executable.into(),
-        version: version.into(),
+        executable: runtime.0.into(),
+        version: runtime.1.into(),
     });
     let mut pending = None;
     loop {
@@ -358,9 +365,20 @@ fn connected_loop(
                         "Unexpected R response ID",
                     ));
                 }
+                if msg.kind == "PLOT" && pending == Some((msg.id, "EVAL")) {
+                    let event = match read_plot(plot_dir, &msg.payload) {
+                        Ok((page, png)) => Event::Plot { page, png },
+                        Err(error) => Event::PlotError(error.to_string()),
+                    };
+                    let _ = events.send(event);
+                    continue;
+                }
                 let event = match msg.kind.as_str() {
                     "STATUS" if pending == Some((msg.id, "PACKAGES")) => {
                         Event::PackageStatus(msg.id, msg.payload)
+                    }
+                    "ENVIRONMENT" if pending == Some((msg.id, "ENVIRONMENT")) => {
+                        Event::Environment(msg.id, msg.payload)
                     }
                     "DONE" if pending != Some((msg.id, "PACKAGES")) => Event::Done(msg.id),
                     "INCOMPLETE" if pending == Some((msg.id, "EVAL")) => {
@@ -390,6 +408,32 @@ fn connected_loop(
         }
         thread::sleep(Duration::from_millis(10));
     }
+}
+
+fn read_plot(directory: &std::path::Path, payload: &str) -> io::Result<(u64, Vec<u8>)> {
+    let (page, filename) = payload
+        .split_once('\t')
+        .ok_or_else(|| io::Error::other("Invalid plot message"))?;
+    let page = page
+        .parse::<u64>()
+        .map_err(|_| io::Error::other("Invalid plot page"))?;
+    let sequence = filename
+        .strip_prefix("plot-")
+        .and_then(|v| v.strip_suffix(".png"))
+        .filter(|v| !v.is_empty() && v.len() <= 16 && v.bytes().all(|c| c.is_ascii_digit()))
+        .ok_or_else(|| io::Error::other("Invalid plot filename"))?;
+    let _ = sequence;
+    let path = directory.join(filename);
+    let file = File::open(&path).map_err(|error| {
+        io::Error::new(error.kind(), format!("Cannot read {filename}: {error}"))
+    })?;
+    let mut png = Vec::new();
+    file.take(8 * 1024 * 1024 + 1).read_to_end(&mut png)?;
+    let _ = fs::remove_file(path);
+    if png.len() > 8 * 1024 * 1024 || !png.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return Err(io::Error::other("Invalid or oversized plot image"));
+    }
+    Ok((page, png))
 }
 
 fn stream_output(
@@ -454,4 +498,25 @@ fn terminate(child: &mut Child) {
         let _ = child.kill();
     }
     let _ = child.wait();
+}
+
+#[cfg(test)]
+mod plot_tests {
+    use super::*;
+    #[test]
+    fn plot_messages_cannot_escape_the_session_directory() {
+        let dir =
+            std::env::temp_dir().join(format!("rsstudio-plot-session-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bytes = b"\x89PNG\r\n\x1a\ntest";
+        std::fs::write(dir.join("plot-0001.png"), bytes).unwrap();
+        assert!(read_plot(&dir, "1\t../plot-0001.png").is_err());
+        assert!(read_plot(&dir, "1\tplot-x.png").is_err());
+        assert_eq!(
+            read_plot(&dir, "7\tplot-0001.png").unwrap(),
+            (7, bytes.to_vec())
+        );
+        assert!(!dir.join("plot-0001.png").exists());
+        std::fs::remove_dir(dir).unwrap();
+    }
 }

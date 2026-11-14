@@ -271,3 +271,169 @@ fn real_r_persistent_session() {
     session.load_package(7, "stats").unwrap();
     wait_for(&session, |e| matches!(e, Event::Done(7)));
 }
+
+#[test]
+fn real_r_environment_reports_loaded_data_and_refreshes() {
+    if !network_available() {
+        return;
+    }
+    if std::process::Command::new("R")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        assert!(
+            std::env::var_os("RSSTUDIO_REQUIRE_R").is_none(),
+            "R is required for this test"
+        );
+        return;
+    }
+    let session = Session::start("R".into(), std::env::temp_dir());
+    wait_for(&session, |e| matches!(e, Event::Ready { .. }));
+    session.evaluate(1, "assign('my data', data.frame(value = c(1, NA, 3), text = c('a', 'é', 'b')), .GlobalEnv)".into()).unwrap();
+    wait_for(&session, |e| matches!(e, Event::Done(1)));
+    session.environment(2).unwrap();
+    let (event, _) = wait_for(&session, |e| matches!(e, Event::Environment(2, _)));
+    let Event::Environment(_, payload) = event else {
+        unreachable!()
+    };
+    let objects: serde_json::Value = serde_json::from_str(&payload).unwrap();
+    let object = objects
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|o| o["name"] == "my data")
+        .unwrap();
+    assert_eq!(object["length"], 3);
+    assert_eq!(object["columns"][0]["missing_in_sample"], 1);
+    assert_eq!(object["columns"][1]["preview"][1], "é");
+    session
+        .evaluate(3, "rm(list='my data', envir=.GlobalEnv)".into())
+        .unwrap();
+    wait_for(&session, |e| matches!(e, Event::Done(3)));
+    session.environment(4).unwrap();
+    let (event, _) = wait_for(&session, |e| matches!(e, Event::Environment(4, _)));
+    let Event::Environment(_, payload) = event else {
+        unreachable!()
+    };
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&payload).unwrap(),
+        serde_json::json!([])
+    );
+}
+
+#[test]
+fn real_r_plots_are_captured_with_layers_and_history() {
+    if !network_available() {
+        return;
+    }
+    if std::process::Command::new("R")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        assert!(
+            std::env::var_os("RSSTUDIO_REQUIRE_R").is_none(),
+            "R is required for this test"
+        );
+        return;
+    }
+    let session = Session::start("R".into(), std::env::temp_dir());
+    wait_for(&session, |e| matches!(e, Event::Ready { .. }));
+    let run = |id, code: &str| {
+        session.evaluate(id, code.into()).unwrap();
+        let mut plots = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            for event in session.poll() {
+                match event {
+                    Event::Plot { page, png } => {
+                        let image = image::load_from_memory(&png).expect("valid PNG");
+                        assert_eq!((image.width(), image.height()), (960, 720));
+                        let pixels = image.into_rgba8();
+                        assert!(
+                            pixels
+                                .pixels()
+                                .any(|p| p.0[0] < 220 && p.0[1] < 220 && p.0[2] < 220),
+                            "plot image must contain visible marks"
+                        );
+                        plots.push((page, png));
+                    }
+                    Event::Done(done) if done == id => return plots,
+                    Event::PlotError(e) | Event::Error(_, e) | Event::Failed(e) => {
+                        panic!("plot failed: {e}")
+                    }
+                    _ => {}
+                }
+            }
+            assert!(Instant::now() < deadline, "plot timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    };
+    let first = run(1, "plot(1:10, main='first')");
+    assert_eq!(first.len(), 1);
+    let overlay = run(2, "points(1:10, col='red', pch=19)");
+    assert_eq!(overlay.len(), 1);
+    assert_eq!(first[0].0, overlay[0].0);
+    assert_ne!(first[0].1, overlay[0].1);
+    assert!(run(3, "x <- 2").is_empty());
+    let later = run(4, "plot(10:1, main='second')");
+    assert_eq!(later.len(), 1);
+    assert_ne!(first[0].0, later[0].0);
+    let looped = run(5, "for (i in 1:2) plot(1:3, main=as.character(i))");
+    assert_eq!(looped.len(), 2);
+    assert_ne!(looped[0].0, looped[1].0);
+    let grid = run(6, "grid::grid.newpage(); grid::grid.text('grid plot')");
+    assert!(!grid.is_empty());
+    let panels = run(
+        7,
+        "par(mfrow=c(2,2)); for (i in 1:4) plot(1:4, main=as.character(i))",
+    );
+    let panel_page = panels.last().expect("multi-panel plot").0;
+    let next_panel = run(8, "plot(1:5, main='next page')");
+    assert_eq!(next_panel.len(), 1);
+    assert_ne!(next_panel[0].0, panel_page);
+    let ggplot = run(
+        9,
+        "par(mfrow=c(1,1)); if (requireNamespace('ggplot2', quietly=TRUE)) print(ggplot2::ggplot(mtcars, ggplot2::aes(mpg, wt)) + ggplot2::geom_point())",
+    );
+    if std::process::Command::new("Rscript")
+        .args([
+            "--vanilla",
+            "-e",
+            "quit(status=if(requireNamespace('ggplot2',quietly=TRUE)) 0 else 1)",
+        ])
+        .status()
+        .is_ok_and(|s| s.success())
+    {
+        assert!(!ggplot.is_empty(), "ggplot2 output should be captured");
+    }
+    assert!(
+        run(
+            10,
+            "png(file.path(tempdir(), 'explicit.png')); plot(1:4); dev.off()"
+        )
+        .is_empty(),
+        "explicit output devices should not become pane plots"
+    );
+    assert!(run(11, "dev.off()").is_empty());
+    assert!(
+        run(
+            12,
+            "png(file.path(tempdir(), 'explicit-after-close.png')); plot(1:4); dev.off()"
+        )
+        .is_empty()
+    );
+    let fresh = run(13, "plot(1:3, main='new device')");
+    assert!(!fresh.is_empty());
+    let overlay = run(
+        14,
+        "par(new=TRUE); plot(1:3, col='blue', axes=FALSE, xlab='', ylab='')",
+    );
+    assert!(!overlay.is_empty());
+    assert!(
+        overlay
+            .iter()
+            .all(|(page, _)| *page == fresh.last().unwrap().0)
+    );
+}

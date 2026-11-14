@@ -2,11 +2,11 @@
 
 ## Project Structure & Module Organization
 
-This repository currently has no source files, tests, assets, or project configuration. Place new code in a clearly named directory appropriate to the chosen language, and keep tests and reusable assets in their own discoverable locations. Document the purpose of each top-level directory here as the project grows. Avoid committing generated output, dependency caches, or local environment files.
+`src/` contains the Rust desktop application, `r/` the R session worker, `tests/` integration tests, `assets/` bundled artwork, `examples/` sample R scripts, and `docs/` project documentation. `vendor/` contains the patched egui-winit integration; see its patch notes before updating it. Avoid committing generated output, dependency caches, or local environment files.
 
 ## Build, Test, and Development Commands
 
-No build system, package manager, or local run command is configured yet. When introducing one, document the exact commands for installing dependencies, running the project, and executing checks in this section. Prefer commands that work from the repository root, and record any required runtime versions or setup steps.
+Install Rust, Cargo, R, and the Linux libraries required by eframe. From the repository root, use `cargo run` to launch the app, `cargo fmt --all -- --check` to check formatting, `cargo clippy --workspace --all-targets -- -D warnings` for linting, and `cargo test --workspace` for tests. Run `RSSTUDIO_REQUIRE_R=1 cargo test --test session_integration` to require R and loopback access in integration tests. On Wayland, image paste also requires `wl-paste` from `wl-clipboard`.
 
 ## Coding Style & Naming Conventions
 
@@ -14,7 +14,7 @@ Follow the conventions of the language and framework selected for the project. U
 
 ## Testing Guidelines
 
-No test framework or coverage target is configured. Add automated tests alongside meaningful behavior changes, using the test framework and naming conventions established by the project. Include a root-level command for running the suite once it exists, and describe any prerequisites or external services needed by the tests.
+Add Rust tests alongside meaningful behavior changes, using the established unit and integration test conventions. The integration suite can skip tests when R or loopback access is unavailable unless `RSSTUDIO_REQUIRE_R=1` is set. No coverage target is configured.
 
 ## Commit & Pull Request Guidelines
 

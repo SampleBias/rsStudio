@@ -1,7 +1,9 @@
 mod agent;
+mod clipboard_image;
 mod console;
 mod editor;
 mod packages;
+mod plots;
 mod protocol;
 mod session;
 mod settings;
@@ -45,6 +47,8 @@ enum PathAction {
     Open,
     SaveAs,
     Project,
+    ImportData,
+    ExportPlot,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -60,9 +64,42 @@ enum PackageOperation {
     Load(String),
 }
 
+fn import_command(path: &std::path::Path, name: &str) -> Result<String, String> {
+    if name.trim().is_empty() || name.len() > 100 || name.contains('\0') {
+        return Err("Enter an object name between 1 and 100 bytes.".into());
+    }
+    let reader = match path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("csv") => "read.csv",
+        Some("tsv") => "read.delim",
+        _ => return Err("Choose a CSV or TSV file.".into()),
+    };
+    let path = path.to_str().ok_or("The file path must be UTF-8.")?;
+    if path.contains('\0') {
+        return Err("Invalid file path.".into());
+    }
+    let path = serde_json::to_string(path).map_err(|e| e.to_string())?;
+    let name = serde_json::to_string(name).map_err(|e| e.to_string())?;
+    Ok(format!(
+        "if (exists({name}, envir = .GlobalEnv, inherits = FALSE)) stop(\"Object already exists; choose another name\") else assign({name}, utils::{reader}({path}, check.names = FALSE), envir = .GlobalEnv)"
+    ))
+}
+
 struct App {
     session: Option<Session>,
     assistant: agent::Agent,
+    plots: plots::Plots,
+    paste_receiver: Option<std::sync::mpsc::Receiver<Result<Option<Vec<u8>>, String>>>,
+    environment: Vec<serde_json::Value>,
+    selected_environment: std::collections::BTreeSet<String>,
+    refresh_environment: bool,
+    pending_environment: bool,
+    environment_notice: String,
+    import_name: String,
     show_assistant: bool,
     crab_icon: egui::TextureHandle,
     editor: Editor,
@@ -117,6 +154,14 @@ impl App {
         let mut app = Self {
             session: None,
             assistant: agent::Agent::default(),
+            plots: plots::Plots::default(),
+            paste_receiver: None,
+            environment: Vec::new(),
+            selected_environment: std::collections::BTreeSet::new(),
+            refresh_environment: true,
+            pending_environment: false,
+            environment_notice: String::new(),
+            import_name: "data".into(),
             show_assistant: true,
             crab_icon,
             editor: Editor::new(),
@@ -165,8 +210,13 @@ impl App {
     fn start(&mut self) {
         // Dropping the old receiver makes late events from that session unreachable.
         self.session.take();
+        self.plots.clear();
         self.pending_id = None;
         self.pending_package = None;
+        self.pending_environment = false;
+        self.refresh_environment = true;
+        self.environment.clear();
+        self.selected_environment.clear();
         self.package_status.clear();
         self.package_notice.clear();
         self.refresh_packages = true;
@@ -401,6 +451,37 @@ impl App {
             self.package_request(operation);
         }
     }
+    fn request_environment(&mut self) {
+        if self.state != State::Ready {
+            return;
+        }
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        if let Some(session) = &self.session {
+            match session.environment(id) {
+                Ok(()) => {
+                    self.pending_id = Some(id);
+                    self.pending_environment = true;
+                    self.refresh_environment = false;
+                    self.state = State::Busy;
+                }
+                Err(error) => {
+                    self.environment_notice = error;
+                    self.refresh_environment = false;
+                }
+            }
+        }
+    }
+    fn paste_image(&mut self) {
+        if self.paste_receiver.is_some() || self.assistant.busy() {
+            return;
+        }
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sender.send(clipboard_image::read());
+        });
+        self.paste_receiver = Some(receiver);
+    }
     fn ask_path(&mut self, action: PathAction) {
         self.path_input = match action {
             PathAction::SaveAs => self
@@ -411,6 +492,7 @@ impl App {
                 .unwrap_or(&self.project)
                 .display()
                 .to_string(),
+            PathAction::ExportPlot => self.project.join("plot.png").display().to_string(),
             _ => self.project.display().to_string(),
         };
         self.path_action = Some(action);
@@ -437,6 +519,17 @@ impl App {
                     ))
                 }
             }),
+            PathAction::ImportData => match import_command(&path, &self.import_name) {
+                Ok(command) => {
+                    if self.submit_text(command, false) {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::other("R is not ready to import data."))
+                    }
+                }
+                Err(error) => Err(std::io::Error::other(error)),
+            },
+            PathAction::ExportPlot => self.plots.export(&path).map_err(std::io::Error::other),
         };
         match result {
             Ok(()) => self.path_action = None,
@@ -477,7 +570,7 @@ impl App {
             self.ask_path(PathAction::SaveAs);
         }
     }
-    fn poll(&mut self) {
+    fn poll(&mut self, ctx: &egui::Context) {
         let mut events = Vec::new();
         if let Some(session) = &self.session {
             events.extend(session.poll());
@@ -491,8 +584,14 @@ impl App {
                 } => {
                     self.runtime = format!("{version} ({executable})");
                     self.state = State::Ready;
+                    self.refresh_environment = true;
                 }
                 Event::Output(text) => self.append(&text),
+                Event::Plot { page, png } => match self.plots.receive(ctx, page, png) {
+                    Ok(()) => self.output_tab = OutputTab::Plots,
+                    Err(error) => self.append(&format!("[Plot error] {error}\n")),
+                },
+                Event::PlotError(error) => self.append(&format!("[Plot error] {error}\n")),
                 Event::Done(id) if self.pending_id == Some(id) => {
                     self.pending_id = None;
                     if let Some(operation) = self.pending_package.take() {
@@ -510,7 +609,36 @@ impl App {
                         self.submitted.clear();
                     }
                     self.refresh_packages = true;
+                    self.refresh_environment = true;
                     self.state = State::Ready;
+                }
+                Event::Environment(id, payload)
+                    if self.pending_id == Some(id) && self.pending_environment =>
+                {
+                    self.pending_id = None;
+                    self.pending_environment = false;
+                    self.state = State::Ready;
+                    match serde_json::from_str::<Vec<serde_json::Value>>(&payload) {
+                        Ok(objects)
+                            if objects.len() <= 20
+                                && objects
+                                    .iter()
+                                    .all(|v| v.get("name").and_then(|s| s.as_str()).is_some()) =>
+                        {
+                            self.environment = objects;
+                            self.selected_environment.retain(|name| {
+                                self.environment
+                                    .iter()
+                                    .any(|v| v["name"].as_str() == Some(name.as_str()))
+                            });
+                            self.environment_notice.clear();
+                        }
+                        _ => {
+                            self.environment.clear();
+                            self.selected_environment.clear();
+                            self.environment_notice = "Could not read the R environment.".into();
+                        }
+                    }
                 }
                 Event::PackageStatus(id, payload)
                     if self.pending_id == Some(id)
@@ -543,6 +671,15 @@ impl App {
                 }
                 Event::Error(id, message) if self.pending_id == Some(id) => {
                     self.pending_id = None;
+                    if self.pending_environment {
+                        self.pending_environment = false;
+                        self.environment.clear();
+                        self.selected_environment.clear();
+                        self.environment_notice =
+                            format!("Could not inspect the R environment: {message}");
+                        self.state = State::Ready;
+                        continue;
+                    }
                     if self.pending_package.take().is_some() {
                         self.package_notice = format!("Package operation failed: {message}");
                         self.package_status.clear();
@@ -553,6 +690,7 @@ impl App {
                     }
                     self.append(&format!("Error: {message}\n"));
                     self.state = State::Ready;
+                    self.refresh_environment = true;
                 }
                 Event::Failed(message) => {
                     if self.pending_id.take().is_some()
@@ -563,6 +701,9 @@ impl App {
                         self.input = std::mem::take(&mut self.submitted);
                     }
                     self.pending_package = None;
+                    self.pending_environment = false;
+                    self.environment.clear();
+                    self.selected_environment.clear();
                     self.package_status.clear();
                     self.package_notice = format!("R session failed: {message}");
                     self.append(&format!("\n[Session error] {message}\n"));
@@ -570,6 +711,8 @@ impl App {
                 }
                 Event::Exited if self.state != State::Failed => {
                     self.state = State::Stopped;
+                    self.environment.clear();
+                    self.selected_environment.clear();
                 }
                 _ => {}
             }
@@ -578,7 +721,10 @@ impl App {
 }
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll();
+        self.poll(ctx);
+        if self.refresh_environment && self.state == State::Ready {
+            self.request_environment();
+        }
         if self.output_tab == OutputTab::Packages
             && self.refresh_packages
             && self.state == State::Ready
@@ -586,6 +732,24 @@ impl eframe::App for App {
             self.package_request(PackageOperation::Query);
         }
         self.assistant.poll();
+        let paste_result = self
+            .paste_receiver
+            .as_ref()
+            .and_then(|rx| match rx.try_recv() {
+                Ok(result) => Some(result),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Some(Err("Clipboard image read failed.".into()))
+                }
+            });
+        if let Some(result) = paste_result {
+            self.paste_receiver = None;
+            match result {
+                Ok(Some(image)) => self.assistant.image = Some(image),
+                Ok(None) => {}
+                Err(error) => self.assistant.error = Some(error),
+            }
+        }
         // Keep an in-flight request visible even if visibility was changed elsewhere.
         if self.assistant.busy() {
             self.show_assistant = true;
@@ -763,51 +927,76 @@ impl eframe::App for App {
                     });
                     ui.small("Requests are sent to OpenRouter and its model provider; model usage may incur charges.");
                     ui.checkbox(&mut self.assistant.include_source, "Include current Source text with requests");
+                    ui.small("Select Environment objects to share their summaries with the agent. Paste an image into the prompt to attach it.");
                     ui.separator();
                     egui::TopBottomPanel::bottom("assistant_request").show_inside(ui, |ui| {
                         ui.label("Ask for R code");
-                        ui.add_enabled(!self.assistant.busy(), egui::TextEdit::multiline(&mut self.assistant.prompt)
+                        let prompt_response = ui.add_enabled(!self.assistant.busy(), egui::TextEdit::multiline(&mut self.assistant.prompt)
                             .desired_rows(3).desired_width(f32::INFINITY)
-                            .hint_text("Describe the analysis or R code you need…"));
+                            .hint_text("Describe your analysis or paste an image…"));
+                        if prompt_response.has_focus() && ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::V)) {
+                            self.paste_image();
+                        }
+                        if self.assistant.image.is_some() {
+                            ui.horizontal(|ui| {
+                                ui.label("Image attached to next request");
+                                if ui.add_enabled(!self.assistant.busy(), egui::Button::new("Remove")).clicked() { self.assistant.image = None; }
+                            });
+                        }
                         ui.horizontal(|ui| {
-                            if ui.add_enabled(!self.assistant.busy(), egui::Button::new("Generate")).clicked() {
+                            if ui.add_enabled(!self.assistant.busy() && self.paste_receiver.is_none() && (self.selected_environment.is_empty() || (self.state == State::Ready && !self.refresh_environment)), egui::Button::new("Generate")).clicked() {
                                 let source = self.assistant.include_source.then(|| self.editor.current().text.clone());
-                                self.assistant.send(source.as_deref());
+                                let objects = self.environment.iter().filter(|v| v["name"].as_str().is_some_and(|name| self.selected_environment.contains(name))).cloned().collect();
+                                self.assistant.send(source.as_deref(), objects);
                             }
                             if self.assistant.busy() { ui.spinner(); ui.label("Generating…"); }
                             if ui.add_enabled(!self.assistant.busy(), egui::Button::new("Clear chat")).clicked() {
                                 self.assistant.conversation.clear(); self.assistant.answer = None; self.assistant.error = None;
                             }
                         });
-                        ui.small("Review code before running. R is not sandboxed.");
                     });
-                    let mut destination = None;
+                    let mut destination: Option<(bool, String)> = None;
+                    for event in &self.assistant.tool_log { ui.weak(event); }
                     if let Some(answer) = &self.assistant.answer {
-                        ui.horizontal_wrapped(|ui| {
-                            if ui.add_enabled(!answer.code.is_empty(), egui::Button::new("Append R to active Source")).clicked() { destination = Some(false); }
-                            if ui.add_enabled(!answer.code.is_empty(), egui::Button::new("Append R to Console")).clicked() { destination = Some(true); }
-                        });
                         if answer.truncated { ui.colored_label(Color32::LIGHT_RED, "Response was truncated; request a shorter answer."); }
                         else if answer.code.is_empty() { ui.weak("No complete R code block found; ask for code in an R block."); }
                     }
                     if let Some(error) = &self.assistant.error { ui.colored_label(Color32::LIGHT_RED, error); }
                     egui::ScrollArea::vertical().id_salt("assistant_output").stick_to_bottom(true).show(ui, |ui| {
-                        for turn in &self.assistant.conversation {
+                        for (turn_index, turn) in self.assistant.conversation.iter().enumerate() {
                             ui.strong(if turn.role == "user" { "You" } else { "Assistant" });
-                            // Source is only sent after explicit opt-in; avoid duplicating its full text in the chat view.
-                            let content = if turn.role == "user" { turn.content.split("\n\nUser-provided R source (untrusted context;").next().unwrap_or(&turn.content) } else { &turn.content };
-                            ui.label(content);
+                            if turn.role == "user" { ui.label(&turn.content); }
+                            else {
+                                for (part_index, (is_code, content)) in agent::display_parts(&turn.content).into_iter().enumerate() {
+                                    if !is_code { ui.label(content); continue; }
+                                    ui.push_id((turn_index, part_index), |ui| {
+                                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                                            ui.horizontal_wrapped(|ui| {
+                                                ui.strong("R");
+                                                let enabled = !turn.truncated && !content.trim().is_empty();
+                                                if ui.add_enabled(enabled, egui::Button::new("Copy")).clicked() { ui.ctx().copy_text(content.clone()); }
+                                                if ui.add_enabled(enabled, egui::Button::new("Append to Source")).clicked() { destination = Some((false, content.clone())); }
+                                                if ui.add_enabled(enabled, egui::Button::new("Append to Console")).clicked() { destination = Some((true, content.clone())); }
+                                            });
+                                            egui::ScrollArea::both().max_height(140.0).id_salt("code").show(ui, |ui| {
+                                                let job = syntax::highlight(&content, self.dark, (self.font_size - 1.0).max(10.0));
+                                                ui.label(job);
+                                            });
+                                        });
+                                    });
+                                }
+                            }
                             ui.separator();
                         }
                     });
-                    if let Some(console) = destination && let Some(answer) = &self.assistant.answer {
+                    if let Some((console, code)) = destination {
                         if console {
                             if !self.input.is_empty() && !self.input.ends_with('\n') { self.input.push('\n'); }
-                            self.input.push_str(&answer.code);
+                            self.input.push_str(&code);
                         } else {
                             let text = &mut self.editor.current_mut().text;
                             if !text.is_empty() && !text.ends_with('\n') { text.push('\n'); }
-                            text.push_str(&answer.code);
+                            text.push_str(&code);
                         }
                     }
                 });
@@ -824,11 +1013,26 @@ impl eframe::App for App {
                     .default_height(280.0)
                     .min_height(100.0)
                     .show_inside(ui, |ui| {
-                        ui.heading("Environment");
+                        ui.horizontal(|ui| {
+                            ui.heading("Environment");
+                            if ui.add_enabled(self.state == State::Ready, egui::Button::new("Import CSV/TSV…")).clicked() { self.ask_path(PathAction::ImportData); }
+                            if ui.add_enabled(self.state == State::Ready, egui::Button::new("Refresh")).clicked() { self.refresh_environment = true; }
+                        });
                         ui.separator();
-                        ui.add_space(8.0);
-                        ui.label("The session's variables will appear here.");
-                        ui.weak("Environment inspection is planned for phase 3.");
+                        ui.small("Select objects to let the assistant inspect their names, types and sample values.");
+                        if !self.environment_notice.is_empty() { ui.colored_label(Color32::LIGHT_RED, &self.environment_notice); }
+                        if self.environment.is_empty() { ui.weak("No objects in the R environment."); }
+                        egui::ScrollArea::vertical().id_salt("environment_objects").show(ui, |ui| {
+                            for object in &self.environment {
+                                let name = object["name"].as_str().unwrap_or_default();
+                                let class = object["class"].as_str().unwrap_or_default();
+                                let count = object["length"].as_u64().unwrap_or_default();
+                                let mut selected = self.selected_environment.contains(name);
+                                if ui.checkbox(&mut selected, format!("{name}  ·  {class}  ·  {count} rows/values")).changed() {
+                                    if selected { self.selected_environment.insert(name.to_owned()); } else { self.selected_environment.remove(name); }
+                                }
+                            }
+                        });
                     });
 
                 ui.horizontal(|ui| {
@@ -900,10 +1104,12 @@ impl eframe::App for App {
                 } else if self.output_tab == OutputTab::Packages {
                     self.packages_ui(ui);
                 } else {
-                    ui.add_space(8.0);
-                    ui.label("Plots will appear here in a later phase.");
+                    if self.plots.show(ui) {
+                        self.ask_path(PathAction::ExportPlot);
+                    }
                 }
             });
+        self.plots.show_zoom(ctx);
 
         let workspace_height = ctx.available_rect().height();
         let console_panel = egui::TopBottomPanel::bottom("console")
@@ -1063,6 +1269,8 @@ impl eframe::App for App {
                 PathAction::Open => "Open file",
                 PathAction::SaveAs => "Save script as",
                 PathAction::Project => "Choose project directory",
+                PathAction::ImportData => "Import CSV or TSV into Environment",
+                PathAction::ExportPlot => "Export plot as PNG",
             };
             egui::Window::new(title)
                 .collapsible(false)
@@ -1072,6 +1280,12 @@ impl eframe::App for App {
                         "Enter an absolute path, or a path relative to the project directory.",
                     );
                     ui.add(egui::TextEdit::singleline(&mut self.path_input).desired_width(400.0));
+                    if action == PathAction::ImportData {
+                        ui.label("R object name:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut self.import_name).desired_width(250.0),
+                        );
+                    }
                     ui.horizontal(|ui| {
                         if ui.button("OK").clicked() {
                             self.apply_path(action);
@@ -1155,5 +1369,100 @@ impl eframe::App for App {
                 });
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod assistant_import_tests {
+    use super::*;
+    #[test]
+    fn import_escapes_user_paths_and_refuses_to_replace_objects() {
+        let command =
+            import_command(std::path::Path::new("/tmp/a\";bad().csv"), "x\";bad()").unwrap();
+        assert!(command.contains("exists("));
+        assert!(command.contains("a\\\";bad().csv"));
+        assert!(command.contains("x\\\";bad()"));
+        assert!(import_command(std::path::Path::new("/tmp/a.rds"), "x").is_err());
+        assert!(import_command(std::path::Path::new("/tmp/a.csv"), "").is_err());
+    }
+
+    #[test]
+    fn generated_import_loads_csv_without_overwriting() {
+        if std::process::Command::new("Rscript")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let path =
+            std::env::temp_dir().join(format!("rsstudio-import-{}-\".csv", std::process::id()));
+        std::fs::write(&path, "value\n1\n2\n").unwrap();
+        let command = import_command(&path, "my data").unwrap();
+        let script = format!(
+            "{command}; stopifnot(nrow(get('my data')) == 2); tryCatch({{{command}; stop('overwrite allowed')}}, error=function(e) stopifnot(grepl('Object already exists', conditionMessage(e))))"
+        );
+        let output = std::process::Command::new("Rscript")
+            .args(["--vanilla", "-e", &script])
+            .output()
+            .unwrap();
+        std::fs::remove_file(path).unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn chat_accepts_image_shortcut_without_breaking_text_paste() {
+        let ctx = egui::Context::default();
+        let mut text = String::new();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                ui.add(egui::TextEdit::multiline(&mut text).id_source("chat_test"))
+                    .request_focus();
+            });
+        });
+        let modifiers = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        };
+        let mut image_paste = false;
+        let _ = ctx.run(
+            egui::RawInput {
+                modifiers,
+                events: vec![egui::Event::Key {
+                    key: egui::Key::V,
+                    physical_key: Some(egui::Key::V),
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let response =
+                        ui.add(egui::TextEdit::multiline(&mut text).id_source("chat_test"));
+                    image_paste = response.has_focus()
+                        && ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::V));
+                });
+            },
+        );
+        assert!(image_paste);
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![egui::Event::Paste("hello".into())],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.add(egui::TextEdit::multiline(&mut text).id_source("chat_test"));
+                });
+            },
+        );
+        assert_eq!(text, "hello");
     }
 }
