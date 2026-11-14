@@ -6,12 +6,14 @@ use std::path::PathBuf;
 pub struct Settings {
     pub dark: bool,
     pub font_size: f32,
+    pub console_fraction: f32,
 }
 impl Default for Settings {
     fn default() -> Self {
         Self {
             dark: true,
             font_size: 14.0,
+            console_fraction: 0.52,
         }
     }
 }
@@ -26,19 +28,29 @@ fn path() -> Option<PathBuf> {
 
 impl Settings {
     pub fn load() -> Self {
+        path()
+            .and_then(|p| fs::read_to_string(p).ok())
+            .map_or_else(Self::default, |contents| Self::parse(&contents))
+    }
+    fn parse(contents: &str) -> Self {
         let mut settings = Self::default();
-        if let Some(contents) = path().and_then(|p| fs::read_to_string(p).ok()) {
-            for line in contents.lines() {
-                if let Some(value) = line.strip_prefix("theme=") {
-                    settings.dark = value != "light";
-                }
-                if let Some(value) = line.strip_prefix("font_size=")
-                    && let Ok(size) = value.parse::<f32>()
-                    && size.is_finite()
-                    && (10.0..=24.0).contains(&size)
-                {
-                    settings.font_size = size;
-                }
+        for line in contents.lines() {
+            if let Some(value) = line.strip_prefix("theme=") {
+                settings.dark = value != "light";
+            }
+            if let Some(value) = line.strip_prefix("font_size=")
+                && let Ok(size) = value.parse::<f32>()
+                && size.is_finite()
+                && (10.0..=24.0).contains(&size)
+            {
+                settings.font_size = size;
+            }
+            if let Some(value) = line.strip_prefix("console_fraction=")
+                && let Ok(fraction) = value.parse::<f32>()
+                && fraction.is_finite()
+                && (0.01..=0.99).contains(&fraction)
+            {
+                settings.console_fraction = fraction;
             }
         }
         settings
@@ -58,9 +70,10 @@ impl Settings {
                 .open(&temp)?;
             writeln!(
                 file,
-                "theme={}\nfont_size={}",
+                "theme={}\nfont_size={}\nconsole_fraction={}",
                 if self.dark { "dark" } else { "light" },
-                self.font_size
+                self.font_size,
+                self.console_fraction
             )?;
             file.sync_all()?;
             fs::rename(&temp, &path)
@@ -88,5 +101,29 @@ impl Settings {
             visuals.selection.bg_fill = Color32::from_rgb(176, 205, 237);
         }
         ctx.set_visuals(visuals);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Settings;
+    #[test]
+    fn restores_console_split_and_preserves_old_settings() {
+        let saved = Settings::parse("theme=light\nfont_size=18\nconsole_fraction=0.61\n");
+        assert!(!saved.dark);
+        assert_eq!(saved.font_size, 18.0);
+        assert_eq!(saved.console_fraction, 0.61);
+        assert_eq!(
+            Settings::parse("theme=dark\nfont_size=15\n").console_fraction,
+            0.52
+        );
+        assert_eq!(
+            Settings::parse("console_fraction=NaN\n").console_fraction,
+            0.52
+        );
+        assert_eq!(
+            Settings::parse("console_fraction=10\n").console_fraction,
+            0.52
+        );
     }
 }

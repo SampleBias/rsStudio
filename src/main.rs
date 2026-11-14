@@ -1,4 +1,5 @@
 mod agent;
+mod console;
 mod editor;
 mod packages;
 mod protocol;
@@ -76,6 +77,7 @@ struct App {
     allow_exit: bool,
     dark: bool,
     font_size: f32,
+    console_fraction: f32,
     find_text: String,
     output_tab: OutputTab,
     packages: Vec<packages::Package>,
@@ -92,6 +94,7 @@ struct App {
     directory: String,
     runtime: String,
     output: String,
+    follow_console: bool,
     input: String,
     submitted: String,
     next_id: u64,
@@ -128,6 +131,7 @@ impl App {
             allow_exit: false,
             dark: prefs.dark,
             font_size: prefs.font_size,
+            console_fraction: prefs.console_fraction,
             find_text: String::new(),
             output_tab: OutputTab::Plots,
             packages: packages::catalog(),
@@ -147,6 +151,7 @@ impl App {
                 .to_string(),
             runtime: String::new(),
             output: String::new(),
+            follow_console: true,
             input: String::new(),
             submitted: String::new(),
             next_id: 1,
@@ -177,6 +182,9 @@ impl App {
     fn append(&mut self, text: &str) {
         const LIMIT: usize = 1024 * 1024;
         self.output.push_str(text);
+        if !text.is_empty() {
+            self.follow_console = true;
+        }
         if self.output.len() > LIMIT {
             let mut cut = self.output.len() - LIMIT;
             while !self.output.is_char_boundary(cut) {
@@ -582,7 +590,7 @@ impl eframe::App for App {
         if self.assistant.busy() {
             self.show_assistant = true;
         }
-        let previous_settings = (self.dark, self.font_size);
+        let previous_settings = (self.dark, self.font_size, self.console_fraction);
         if ctx.input(|i| i.viewport().close_requested())
             && self.editor.any_dirty()
             && !self.allow_exit
@@ -611,33 +619,94 @@ impl eframe::App for App {
         ctx.request_repaint_after(Duration::from_millis(50));
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
-                ui.add(egui::Image::new((self.crab_icon.id(), egui::vec2(24.0, 24.0))).alt_text("crab"));
+                ui.add(
+                    egui::Image::new((self.crab_icon.id(), egui::vec2(24.0, 24.0)))
+                        .alt_text("crab"),
+                );
                 ui.heading("rsStudio");
                 ui.separator();
                 let (name, color) = match self.state {
-                    State::Starting => ("Starting", if self.dark { Color32::YELLOW } else { Color32::from_rgb(120, 80, 0) }),
-                    State::Ready => ("Ready", if self.dark { Color32::LIGHT_GREEN } else { Color32::from_rgb(0, 105, 45) }),
-                    State::Busy => ("Running", if self.dark { Color32::YELLOW } else { Color32::from_rgb(120, 80, 0) }),
-                    State::Failed => ("Failed", if self.dark { Color32::LIGHT_RED } else { Color32::from_rgb(165, 30, 30) }),
-                    State::Stopped => ("Stopped", if self.dark { Color32::GRAY } else { Color32::DARK_GRAY }),
+                    State::Starting => (
+                        "Starting",
+                        if self.dark {
+                            Color32::YELLOW
+                        } else {
+                            Color32::from_rgb(120, 80, 0)
+                        },
+                    ),
+                    State::Ready => (
+                        "Ready",
+                        if self.dark {
+                            Color32::LIGHT_GREEN
+                        } else {
+                            Color32::from_rgb(0, 105, 45)
+                        },
+                    ),
+                    State::Busy => (
+                        "Running",
+                        if self.dark {
+                            Color32::YELLOW
+                        } else {
+                            Color32::from_rgb(120, 80, 0)
+                        },
+                    ),
+                    State::Failed => (
+                        "Failed",
+                        if self.dark {
+                            Color32::LIGHT_RED
+                        } else {
+                            Color32::from_rgb(165, 30, 30)
+                        },
+                    ),
+                    State::Stopped => (
+                        "Stopped",
+                        if self.dark {
+                            Color32::GRAY
+                        } else {
+                            Color32::DARK_GRAY
+                        },
+                    ),
                 };
                 ui.label(RichText::new(format!("● {name}")).color(color));
-                if !self.runtime.is_empty() { ui.label(&self.runtime); }
-                if ui.button("Restart R…").clicked() { self.confirm_restart = true; }
-                if ui.button("Clear output").clicked() { self.output.clear(); }
-                if ui.button(if self.dark { "Light theme" } else { "Dark theme" }).clicked() {
+                if !self.runtime.is_empty() {
+                    ui.label(&self.runtime);
+                }
+                if ui.button("Restart R…").clicked() {
+                    self.confirm_restart = true;
+                }
+                if ui.button("Clear output").clicked() {
+                    self.output.clear();
+                }
+                if ui
+                    .button(if self.dark {
+                        "Light theme"
+                    } else {
+                        "Dark theme"
+                    })
+                    .clicked()
+                {
                     self.dark = !self.dark;
-                    settings::Settings { dark: self.dark, font_size: self.font_size }.apply(ctx);
+                    settings::Settings {
+                        dark: self.dark,
+                        font_size: self.font_size,
+                        console_fraction: self.console_fraction,
+                    }
+                    .apply(ctx);
                 }
             });
             ui.horizontal(|ui| {
                 ui.label("R executable:");
-                ui.add(egui::TextEdit::singleline(&mut self.executable).hint_text("R on PATH").desired_width(180.0));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.executable)
+                        .hint_text("R on PATH")
+                        .desired_width(180.0),
+                );
                 ui.label("Working directory:");
                 ui.add(egui::TextEdit::singleline(&mut self.directory).desired_width(260.0));
-                if ui.button("Apply & restart…").clicked() { self.confirm_restart = true; }
+                if ui.button("Apply & restart…").clicked() {
+                    self.confirm_restart = true;
+                }
             });
-            ui.small("R runs with --vanilla: startup profiles and saved workspaces are not loaded. Changes to the R path or directory apply on restart.");
         });
         // Keep the tile visible even when the assistant panel is collapsed.
         egui::SidePanel::right("assistant_tile")
@@ -646,14 +715,17 @@ impl eframe::App for App {
             .show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
                     let label = if self.show_assistant {
-                        "Hide R assistant"
+                        "Hide R-gentic"
                     } else {
-                        "Show R assistant"
+                        "Show R-gentic"
                     };
                     let tile = ui.add_enabled(
                         !self.assistant.busy(),
-                        egui::Button::selectable(self.show_assistant, "R\nAI")
-                            .min_size(egui::vec2(32.0, 38.0)),
+                        egui::Button::selectable(
+                            self.show_assistant,
+                            RichText::new(if self.show_assistant { "›" } else { "‹" }).size(24.0),
+                        )
+                        .min_size(egui::vec2(32.0, 38.0)),
                     );
                     if tile
                         .on_hover_text(label)
@@ -676,7 +748,7 @@ impl eframe::App for App {
             egui::SidePanel::right("coding_assistant")
                 .resizable(true).default_width(340.0).min_width(250.0)
                 .show(ctx, |ui| {
-                    ui.heading("R assistant");
+                    ui.heading("R-gentic Assist");
                     ui.weak("OpenRouter · R code suggestions");
                     ui.separator();
                     ui.label("API key (kept in memory for this session)");
@@ -691,7 +763,6 @@ impl eframe::App for App {
                     });
                     ui.small("Requests are sent to OpenRouter and its model provider; model usage may incur charges.");
                     ui.checkbox(&mut self.assistant.include_source, "Include current Source text with requests");
-                    ui.small("Only your request, conversation, and selected optional source are sent. The assistant has no local tools.");
                     ui.separator();
                     egui::TopBottomPanel::bottom("assistant_request").show_inside(ui, |ui| {
                         ui.label("Ask for R code");
@@ -834,49 +905,32 @@ impl eframe::App for App {
                 }
             });
 
-        egui::TopBottomPanel::bottom("console")
+        let workspace_height = ctx.available_rect().height();
+        let console_panel = egui::TopBottomPanel::bottom("console")
             .resizable(true)
-            .default_height(300.0)
-            .min_height(170.0)
+            .default_height(workspace_height * self.console_fraction)
+            .min_height(220.0)
+            .max_height((workspace_height - 140.0).max(220.0))
             .show(ctx, |ui| {
-                // Reserve the bottom of the console for its input, leaving the
-                // remaining area for scrollable output.
-                egui::TopBottomPanel::bottom("console_input").show_inside(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.strong("R input");
-                        if ui
-                            .add_enabled(
-                                self.state == State::Ready,
-                                egui::Button::new("Run  Ctrl+Enter"),
-                            )
-                            .clicked()
-                        {
-                            self.submit();
-                        }
-                    });
-                    let input = ui.add_enabled(
-                        self.state == State::Ready,
-                        egui::TextEdit::multiline(&mut self.input)
-                            .font(egui::TextStyle::Monospace)
-                            .desired_rows(2)
-                            .desired_width(f32::INFINITY),
-                    );
-                    if input.has_focus()
-                        && ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Enter))
-                    {
-                        self.submit();
-                    }
-                });
-
-                ui.heading("Console");
-                ui.weak("Submission console: interactive terminal input is not supported.");
-                ui.separator();
-                egui::ScrollArea::vertical()
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        ui.monospace(&self.output);
-                    });
+                let view = console::show(
+                    ui,
+                    &self.output,
+                    &mut self.input,
+                    self.state == State::Ready,
+                    std::mem::take(&mut self.follow_console),
+                );
+                if view.run {
+                    self.submit();
+                }
             });
+        if workspace_height > 0.0
+            && ctx
+                .read_response(egui::Id::new("console").with("__resize"))
+                .is_some_and(|response| response.drag_stopped())
+        {
+            self.console_fraction =
+                (console_panel.response.rect.height() / workspace_height).clamp(0.01, 0.99);
+        }
 
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -1082,10 +1136,11 @@ impl eframe::App for App {
                     }
                 });
         }
-        if previous_settings != (self.dark, self.font_size) {
+        if previous_settings != (self.dark, self.font_size, self.console_fraction) {
             let prefs = settings::Settings {
                 dark: self.dark,
                 font_size: self.font_size,
+                console_fraction: self.console_fraction,
             };
             if let Err(error) = prefs.save() {
                 self.message = Some(format!("Could not save preferences: {error}"));
