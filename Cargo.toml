@@ -1,0 +1,10 @@
+[package]
+name = "rsstudio"
+version = "0.1.0"
+edition = "2024"
+description = "A Rust-native IDE for R"
+license = "MIT"
+
+[dependencies]
+eframe = { version = "0.33", default-features = false, features = ["default_fonts", "glow", "x11", "wayland"] }
+
