@@ -1,11 +1,15 @@
 use crate::packages::valid_name;
-use crate::protocol::{self, Message};
+use crate::protocol;
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, SyncSender, TryRecvError};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU32, Ordering},
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -36,14 +40,16 @@ enum Request {
 pub struct Session {
     commands: SyncSender<Request>,
     events: Option<Receiver<Event>>,
-    worker: Option<thread::JoinHandle<()>>,
+    control: Arc<Control>,
 }
 impl Session {
     pub fn start(executable: String, directory: PathBuf) -> Self {
         let (commands, requests) = mpsc::sync_channel(4);
         let (events, rx) = mpsc::sync_channel(256);
-        let worker = thread::spawn(move || {
-            let result = run(executable, directory, &requests, &events);
+        let control = Arc::new(Control::default());
+        let worker_control = Arc::clone(&control);
+        thread::spawn(move || {
+            let result = run(executable, directory, &requests, &events, &worker_control);
             if let Err(error) = result {
                 let _ = events.send(Event::Failed(error.to_string()));
             }
@@ -52,7 +58,7 @@ impl Session {
         Self {
             commands,
             events: Some(rx),
-            worker: Some(worker),
+            control,
         }
     }
     pub fn evaluate(&self, id: u64, text: String) -> Result<(), String> {
@@ -100,17 +106,46 @@ impl Session {
             .unwrap_or_default()
     }
     pub fn stop(&self) {
+        self.control.cancelled.store(true, Ordering::Release);
         let _ = self.commands.try_send(Request::Stop);
     }
 }
 impl Drop for Session {
     fn drop(&mut self) {
         self.stop();
-        // Disconnect before joining so a full event queue cannot block shutdown.
+        // Cancellation and group termination do not wait for pipes or filesystem I/O.
+        // The supervisor reaps the child and removes its scratch directory off the UI.
         self.events.take();
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+        self.control.kill_group();
+    }
+}
+
+#[derive(Default)]
+struct Control {
+    cancelled: AtomicBool,
+    group: AtomicU32,
+}
+impl Control {
+    fn register(&self, child: &Child) {
+        self.group.store(child.id(), Ordering::Release);
+        if self.cancelled.load(Ordering::Acquire) {
+            self.kill_group();
         }
+    }
+    fn kill_group(&self) {
+        let group = self.group.swap(0, Ordering::AcqRel);
+        #[cfg(unix)]
+        if group != 0 {
+            // All supervised processes start in an owned group, including --version.
+            unsafe extern "C" {
+                fn kill(pid: i32, signal: i32) -> i32;
+            }
+            unsafe {
+                kill(-(group as i32), 9);
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = group;
     }
 }
 
@@ -138,6 +173,7 @@ fn run(
     directory: PathBuf,
     requests: &Receiver<Request>,
     events: &SyncSender<Event>,
+    control: &Control,
 ) -> io::Result<()> {
     let _ = events.send(Event::Starting);
     if !directory.is_dir() {
@@ -152,7 +188,7 @@ fn run(
         executable.trim().to_owned()
     };
     let executable = resolve_executable(&executable)?;
-    let version = version(&executable, requests)?;
+    let version = version(&executable, requests, control)?;
     let secret = random_secret()?;
     let scratch_name = random_secret()?;
     let scratch = Scratch(
@@ -166,7 +202,7 @@ fn run(
     #[cfg(not(unix))]
     fs::create_dir(&scratch.0)?;
     let script = scratch.0.join("worker.R");
-    fs::write(&script, WORKER)?;
+    fs::write(&script, worker_source())?;
     let listener = TcpListener::bind("127.0.0.1:0")?;
     listener.set_nonblocking(true)?;
     let port = listener.local_addr()?.port();
@@ -186,9 +222,9 @@ fn run(
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
     }
-    let mut child = cmd
-        .spawn()
+    let mut child = spawn_before(&mut cmd, control, Instant::now() + START_TIMEOUT)
         .map_err(|e| io::Error::new(e.kind(), format!("Could not start R '{executable}': {e}")))?;
+    control.register(&child);
     stream_output(child.stdout.take().unwrap(), events.clone(), "");
     stream_output(child.stderr.take().unwrap(), events.clone(), "[stderr] ");
     let result = connected_loop(
@@ -198,10 +234,20 @@ fn run(
         &mut child,
         requests,
         events,
-        &scratch.0,
+        (control, &scratch.0),
     );
-    terminate(&mut child);
+    terminate(&mut child, control);
     result
+}
+
+pub(crate) fn worker_source() -> String {
+    // Keep helper definitions out of the user's .GlobalEnv without relying on
+    // textual insertion into the worker's body.
+    format!(
+        "local({{\n{}\n{}\n}})\n",
+        include_str!("../r/warnings.R"),
+        WORKER
+    )
 }
 
 fn resolve_executable(name: &str) -> io::Result<String> {
@@ -228,40 +274,154 @@ fn resolve_executable(name: &str) -> io::Result<String> {
     Ok(candidate.to_string_lossy().into_owned())
 }
 
-fn version(executable: &str, requests: &Receiver<Request>) -> io::Result<String> {
-    let mut child = Command::new(executable).arg("--version").stdin(Stdio::null())
-        .stdout(Stdio::piped()).stderr(Stdio::null()).spawn()
-        .map_err(|e| io::Error::new(e.kind(), format!("R executable '{executable}' could not be launched: {e}. Install R or enter its full path.")))?;
-    let stdout = child.stdout.take().unwrap();
-    let reader = thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = stdout.take(64 * 1024).read_to_end(&mut buf);
-        buf
-    });
-    let started = Instant::now();
+fn spawn_before(command: &mut Command, control: &Control, deadline: Instant) -> io::Result<Child> {
     loop {
-        if stopped(requests) || started.elapsed() > START_TIMEOUT {
-            let _ = child.kill();
-            let _ = child.wait();
+        if control.cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "R version check cancelled or timed out",
+                "R launch cancelled or timed out",
             ));
         }
-        if let Some(status) = child.try_wait()? {
-            let output = reader.join().unwrap_or_default();
-            let text = String::from_utf8_lossy(&output);
-            let first = text.lines().next().unwrap_or_default().trim();
-            if !status.success() || !first.starts_with("R version ") {
+        match command.spawn() {
+            // Wrappers and executables can briefly remain open for writing during
+            // installation or filesystem synchronization. Retry within the deadline.
+            Err(error) if error.kind() == io::ErrorKind::ExecutableFileBusy => {
+                thread::sleep(Duration::from_millis(10))
+            }
+            result => return result,
+        }
+    }
+}
+
+fn version(
+    executable: &str,
+    requests: &Receiver<Request>,
+    control: &Control,
+) -> io::Result<String> {
+    version_with_timeout(executable, requests, control, START_TIMEOUT)
+}
+
+fn version_with_timeout(
+    executable: &str,
+    requests: &Receiver<Request>,
+    control: &Control,
+    timeout: Duration,
+) -> io::Result<String> {
+    let deadline = Instant::now() + timeout;
+    let mut command = Command::new(executable);
+    command
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = spawn_before(&mut command, control, deadline).map_err(|e| io::Error::new(e.kind(), format!("R executable '{executable}' could not be launched: {e}. Install R or enter its full path.")))?;
+    control.register(&child);
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let mut output = Vec::new();
+        let result = stdout
+            .take(64 * 1024)
+            .read_to_end(&mut output)
+            .map(|_| output);
+        let _ = tx.send(result);
+    });
+    let result = (|| {
+        let mut status = None;
+        let mut output = None;
+        loop {
+            if control.cancelled.load(Ordering::Acquire)
+                || stopped(requests)
+                || Instant::now() >= deadline
+            {
                 return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "The selected executable did not report a valid R version",
+                    io::ErrorKind::TimedOut,
+                    "R version check cancelled or timed out",
                 ));
             }
-            return Ok(first.to_owned());
+            if status.is_none() {
+                status = child.try_wait()?;
+                if status.is_some() {
+                    // A wrapper may exit while a descendant retains the stdout pipe.
+                    control.kill_group();
+                }
+            }
+            if output.is_none() {
+                match rx.try_recv() {
+                    Ok(result) => output = Some(result?),
+                    Err(TryRecvError::Disconnected) => {
+                        return Err(io::Error::other("R version output reader stopped"));
+                    }
+                    Err(TryRecvError::Empty) => {}
+                }
+            }
+            if let (Some(status), Some(output)) = (&status, &output) {
+                let text = String::from_utf8_lossy(output);
+                let first = text.lines().next().unwrap_or_default().trim();
+                if !status.success() || !first.starts_with("R version ") {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "The selected executable did not report a valid R version",
+                    ));
+                }
+                return Ok(first.to_owned());
+            }
+            thread::sleep(Duration::from_millis(10));
         }
-        thread::sleep(Duration::from_millis(20));
+    })();
+    terminate(&mut child, control);
+    result
+}
+
+fn read_hello(
+    mut reader: impl Read,
+    secret: &str,
+    deadline: Instant,
+    control: &Control,
+) -> io::Result<()> {
+    // A known-size greeting prevents a partial or oversized unauthenticated frame
+    // from extending startup indefinitely. The socket is nonblocking here.
+    let mut expected = Vec::new();
+    protocol::write_message(&mut expected, "HELLO", 0, &format!("1:{secret}"))?;
+    let mut received = vec![0; expected.len()];
+    let mut offset = 0;
+    while offset < received.len() {
+        if control.cancelled.load(Ordering::Acquire) || Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "R greeting cancelled or timed out",
+            ));
+        }
+        match reader.read(&mut received[offset..]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Incomplete R greeting",
+                ));
+            }
+            Ok(n) => {
+                let end = offset + n;
+                if received[offset..end] != expected[offset..end] {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Invalid R greeting",
+                    ));
+                }
+                offset = end;
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(10))
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
     }
+    Ok(())
 }
 
 fn connected_loop(
@@ -271,11 +431,12 @@ fn connected_loop(
     child: &mut Child,
     requests: &Receiver<Request>,
     events: &SyncSender<Event>,
-    plot_dir: &std::path::Path,
+    resources: (&Control, &std::path::Path),
 ) -> io::Result<()> {
+    let (control, plot_dir) = resources;
     let started = Instant::now();
     let stream = loop {
-        if stopped(requests) {
+        if control.cancelled.load(Ordering::Acquire) || stopped(requests) {
             return Ok(());
         }
         if child.try_wait()?.is_some() {
@@ -290,17 +451,12 @@ fn connected_loop(
             ));
         }
         match listener.accept() {
-            Ok((stream, _)) => {
-                stream.set_read_timeout(Some(Duration::from_millis(500)))?;
-                let hello = protocol::read_message(&mut &stream);
-                if let Ok(Message {
-                    kind,
-                    id: 0,
-                    payload,
-                }) = hello
-                    && kind == "HELLO"
-                    && payload == format!("1:{secret}")
-                {
+            Ok((mut stream, _)) => {
+                stream.set_nonblocking(true)?;
+                let deadline =
+                    (Instant::now() + Duration::from_millis(500)).min(started + START_TIMEOUT);
+                if read_hello(&mut stream, secret, deadline, control).is_ok() {
+                    stream.set_nonblocking(false)?;
                     break stream;
                 }
             }
@@ -333,7 +489,12 @@ fn connected_loop(
         if child.try_wait()?.is_some() {
             return Err(io::Error::other("R exited unexpectedly"));
         }
-        match requests.try_recv() {
+        let request = if control.cancelled.load(Ordering::Acquire) {
+            Ok(Request::Stop)
+        } else {
+            requests.try_recv()
+        };
+        match request {
             Ok(Request::Stop) | Err(TryRecvError::Disconnected) => {
                 if pending.is_none() {
                     let _ = protocol::write_message(&mut writer, "SHUTDOWN", 0, "");
@@ -424,9 +585,22 @@ fn read_plot(directory: &std::path::Path, payload: &str) -> io::Result<(u64, Vec
         .ok_or_else(|| io::Error::other("Invalid plot filename"))?;
     let _ = sequence;
     let path = directory.join(filename);
-    let file = File::open(&path).map_err(|error| {
+    if !fs::metadata(&path)?.is_file() {
+        return Err(io::Error::other("Plot image is not a regular file"));
+    }
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(0x800); // O_NONBLOCK prevents a FIFO replacement from hanging cleanup.
+    }
+    let file = options.open(&path).map_err(|error| {
         io::Error::new(error.kind(), format!("Cannot read {filename}: {error}"))
     })?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other("Plot image is not a regular file"));
+    }
     let mut png = Vec::new();
     file.take(8 * 1024 * 1024 + 1).read_to_end(&mut png)?;
     let _ = fs::remove_file(path);
@@ -483,21 +657,202 @@ fn stream_output(
     });
 }
 
-fn terminate(child: &mut Child) {
+fn terminate(child: &mut Child, control: &Control) {
+    // Kill the owned group even if its leader has already exited.
+    control.kill_group();
     if matches!(child.try_wait(), Ok(None)) {
-        #[cfg(unix)]
-        {
-            // The child is its own process group, so descendants are stopped as well.
-            unsafe extern "C" {
-                fn kill(pid: i32, signal: i32) -> i32;
-            }
-            unsafe {
-                kill(-(child.id() as i32), 9);
-            }
-        }
         let _ = child.kill();
     }
     let _ = child.wait();
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod lifecycle_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+
+    struct Script(PathBuf);
+    impl Script {
+        fn new(body: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "rsstudio-process-test-{}-{}",
+                std::process::id(),
+                random_secret().unwrap()
+            ));
+            fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+            Self(path)
+        }
+    }
+    impl Drop for Script {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+    fn running(pid: u32) -> bool {
+        fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|s| s.rsplit_once(") ").map(|(_, rest)| !rest.starts_with('Z')))
+            .unwrap_or(false)
+    }
+    fn assert_stopped(pid: u32) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while running(pid) && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!running(pid), "descendant {pid} survived cleanup");
+    }
+    #[test]
+    fn partial_greeting_obeys_one_deadline_and_cancellation() {
+        struct Stalled;
+        impl Read for Stalled {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::ErrorKind::WouldBlock.into())
+            }
+        }
+        let control = Control::default();
+        let started = Instant::now();
+        let error = read_hello(
+            Stalled,
+            "secret",
+            started + Duration::from_millis(60),
+            &control,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        control.cancelled.store(true, Ordering::Release);
+        assert!(read_hello(Stalled, "secret", Instant::now() + START_TIMEOUT, &control).is_err());
+        control.cancelled.store(false, Ordering::Release);
+        let mut greeting = Vec::new();
+        protocol::write_message(&mut greeting, "HELLO", 0, "1:secret").unwrap();
+        read_hello(
+            std::io::Cursor::new(&greeting),
+            "secret",
+            Instant::now() + START_TIMEOUT,
+            &control,
+        )
+        .unwrap();
+        assert!(
+            read_hello(
+                std::io::Cursor::new(greeting),
+                "wrong-secret",
+                Instant::now() + START_TIMEOUT,
+                &control
+            )
+            .is_err()
+        );
+    }
+    #[test]
+    fn version_retries_a_temporarily_busy_executable() {
+        let script = Script::new("printf 'R version 4.4.0 (test)\\n'");
+        let writer = fs::OpenOptions::new().append(true).open(&script.0).unwrap();
+        let path = script.0.clone();
+        let (tx, result) = mpsc::channel();
+        thread::spawn(move || {
+            let (_commands, requests) = mpsc::sync_channel(1);
+            let _ = tx.send(version_with_timeout(
+                path.to_str().unwrap(),
+                &requests,
+                &Control::default(),
+                Duration::from_secs(2),
+            ));
+        });
+        thread::sleep(Duration::from_millis(80));
+        drop(writer);
+        assert!(
+            result
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap()
+                .unwrap()
+                .starts_with("R version ")
+        );
+    }
+    #[test]
+    fn version_pipe_inherited_by_descendant_does_not_block() {
+        let script = Script::new("sleep 30 &\nprintf 'R version 4.4.0 (test)\\n'\nexit 0");
+        let (_tx, rx) = mpsc::sync_channel(1);
+        let control = Control::default();
+        let started = Instant::now();
+        let version = version_with_timeout(
+            script.0.to_str().unwrap(),
+            &rx,
+            &control,
+            Duration::from_secs(1),
+        )
+        .unwrap();
+        assert!(version.starts_with("R version "));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+    #[test]
+    fn version_deadline_kills_a_hung_wrapper() {
+        let script = Script::new("exec sleep 30");
+        let (_tx, rx) = mpsc::sync_channel(1);
+        let control = Control::default();
+        let started = Instant::now();
+        let result = version_with_timeout(
+            script.0.to_str().unwrap(),
+            &rx,
+            &control,
+            Duration::from_millis(150),
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(control.group.load(Ordering::Acquire), 0);
+    }
+    #[test]
+    fn cleanup_kills_descendants_after_group_leader_exits() {
+        let control = Control::default();
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 30 & echo $!; exit 0"])
+            .stdout(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        control.register(&child);
+        let mut line = String::new();
+        BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let descendant = line.trim().parse().unwrap();
+        child.wait().unwrap();
+        terminate(&mut child, &control);
+        assert_stopped(descendant);
+    }
+    #[test]
+    fn dropping_session_cancels_version_check_without_joining_ui() {
+        let marker = Script::new("");
+        fs::remove_file(&marker.0).unwrap();
+        let script = Script::new(&format!(
+            "echo $$ > '{}'\nexec sleep 30",
+            marker.0.display()
+        ));
+        let session = Session::start(
+            script.0.to_string_lossy().into_owned(),
+            std::env::temp_dir(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let pid = loop {
+            if let Some(pid) = fs::read_to_string(&marker.0)
+                .ok()
+                .and_then(|s| s.trim().parse().ok())
+            {
+                break pid;
+            }
+            for event in session.poll() {
+                if let Event::Failed(error) = event {
+                    panic!("Test wrapper failed to start: {error}");
+                }
+            }
+            assert!(Instant::now() < deadline, "Test wrapper did not start");
+            thread::sleep(Duration::from_millis(10));
+        };
+        let started = Instant::now();
+        drop(session);
+        assert!(started.elapsed() < Duration::from_millis(100));
+        assert_stopped(pid);
+    }
 }
 
 #[cfg(test)]
@@ -517,6 +872,28 @@ mod plot_tests {
             (7, bytes.to_vec())
         );
         assert!(!dir.join("plot-0001.png").exists());
+        #[cfg(target_os = "linux")]
+        {
+            let fifo = dir.join("plot-0002.png");
+            assert!(
+                Command::new("mkfifo")
+                    .arg(&fifo)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let read_dir = dir.clone();
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let _ = tx.send(read_plot(&read_dir, "2\tplot-0002.png"));
+            });
+            assert!(
+                rx.recv_timeout(Duration::from_secs(1))
+                    .expect("Plot FIFO blocked the supervisor")
+                    .is_err()
+            );
+            fs::remove_file(fifo).unwrap();
+        }
         std::fs::remove_dir(dir).unwrap();
     }
 }

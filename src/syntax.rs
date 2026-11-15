@@ -133,3 +133,88 @@ mod tests {
         assert_eq!(tokens.iter().map(|(s, _)| *s).collect::<String>(), s);
     }
 }
+
+/// Cache one active source document. Text comparison also catches programmatic
+/// edits and TextEdit's intermediate layouts without requiring revision bookkeeping.
+#[derive(Default)]
+pub struct SourceCache {
+    text: String,
+    numbers: String,
+    job: Option<(bool, u32, LayoutJob)>,
+}
+impl SourceCache {
+    fn update_text(&mut self, text: &str) {
+        if self.text != text || self.numbers.is_empty() {
+            self.text.clear();
+            self.text.push_str(text);
+            let lines = text.lines().count() + usize::from(text.is_empty() || text.ends_with('\n'));
+            self.numbers = (1..=lines).map(|n| format!("{n}\n")).collect();
+            self.job = None;
+        }
+    }
+    pub fn line_numbers(&mut self, text: &str) -> &str {
+        self.update_text(text);
+        &self.numbers
+    }
+    pub fn layout(
+        &mut self,
+        ui: &eframe::egui::Ui,
+        text: &str,
+        dark: bool,
+        size: f32,
+    ) -> std::sync::Arc<eframe::egui::Galley> {
+        self.update_text(text);
+        if self
+            .job
+            .as_ref()
+            .is_none_or(|(cached_dark, cached_size, _)| {
+                (*cached_dark, *cached_size) != (dark, size.to_bits())
+            })
+        {
+            let mut job = highlight(text, dark, size);
+            job.wrap.max_width = f32::INFINITY;
+            self.job = Some((dark, size.to_bits(), job));
+        }
+        // egui owns the galley cache and invalidates it when the font atlas or
+        // display scale changes. Retaining a Galley ourselves could paint stale UVs.
+        ui.fonts_mut(|fonts| fonts.layout_job(self.job.as_ref().unwrap().2.clone()))
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    use super::*;
+    use eframe::egui;
+    #[test]
+    fn layout_reuses_unchanged_source_and_invalidates_content_font_and_theme() {
+        let ctx = egui::Context::default();
+        let mut cache = SourceCache::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                use std::sync::Arc;
+                assert_eq!(cache.line_numbers("x <- 1\n"), "1\n2\n");
+                let first = cache.layout(ui, "x <- 1\n", true, 14.0);
+                assert!(Arc::ptr_eq(
+                    &first,
+                    &cache.layout(ui, "x <- 1\n", true, 14.0)
+                ));
+                assert!(!Arc::ptr_eq(
+                    &first,
+                    &cache.layout(ui, "x <- 2\n", true, 14.0)
+                ));
+                let dark = cache.layout(ui, "x <- 2\n", true, 14.0);
+                assert!(!Arc::ptr_eq(
+                    &dark,
+                    &cache.layout(ui, "x <- 2\n", false, 14.0)
+                ));
+                let small = cache.layout(ui, "x <- 2\n", false, 14.0);
+                assert!(!Arc::ptr_eq(
+                    &small,
+                    &cache.layout(ui, "x <- 2\n", false, 18.0)
+                ));
+                assert_eq!(cache.line_numbers("x <- 2\ny <- 3"), "1\n2\n");
+                assert_eq!(cache.line_numbers(""), "1\n");
+            });
+        });
+    }
+}

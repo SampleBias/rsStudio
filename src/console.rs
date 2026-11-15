@@ -137,3 +137,39 @@ mod tests {
         }
     }
 }
+
+/// Apply all output from one UI update with at most one prefix removal.
+pub fn append_batch(output: &mut String, batch: &str) {
+    if batch.is_empty() {
+        return;
+    }
+    const LIMIT: usize = 1024 * 1024;
+    const MARKER: &str = "[Earlier output truncated]\n";
+    output.push_str(batch);
+    if output.len() > LIMIT {
+        let mut cut = output.len() - (LIMIT - MARKER.len());
+        while !output.is_char_boundary(cut) {
+            cut += 1;
+        }
+        output.drain(..cut);
+        output.insert_str(0, MARKER);
+    }
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::append_batch;
+    #[test]
+    fn batched_output_is_bounded_and_keeps_the_latest_unicode() {
+        let mut output = "old\n".repeat(300_000);
+        append_batch(&mut output, &"π\n".repeat(400_000));
+        assert!(output.len() <= 1024 * 1024);
+        assert!(output.starts_with("[Earlier output truncated]\n"));
+        assert!(output.ends_with("π\n"));
+        assert_eq!(output.matches("[Earlier output truncated]").count(), 1);
+        append_batch(&mut output, "last\n");
+        assert!(output.len() <= 1024 * 1024);
+        assert!(output.ends_with("π\nlast\n"));
+        assert_eq!(output.matches("[Earlier output truncated]").count(), 1);
+    }
+}

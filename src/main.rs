@@ -2,6 +2,7 @@ mod agent;
 mod clipboard_image;
 mod console;
 mod editor;
+mod file_worker;
 mod packages;
 mod plots;
 mod protocol;
@@ -12,9 +13,8 @@ mod syntax;
 use editor::Editor;
 use eframe::egui::{self, Color32, RichText};
 use session::{Event, Session};
-use std::fs;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 fn main() -> eframe::Result {
     eframe::run_native(
@@ -103,6 +103,13 @@ struct App {
     show_assistant: bool,
     crab_icon: egui::TextureHandle,
     editor: Editor,
+    files: file_worker::Worker,
+    file_busy: bool,
+    preferences_changed: Option<Instant>,
+    preferences_pending: bool,
+    deferred_exit: bool,
+    source_cache: syntax::SourceCache,
+    output_pending: String,
     project: PathBuf,
     project_entries: Vec<(PathBuf, bool)>,
     project_error: Option<String>,
@@ -165,6 +172,13 @@ impl App {
             show_assistant: true,
             crab_icon,
             editor: Editor::new(),
+            files: file_worker::Worker::new(),
+            file_busy: false,
+            preferences_changed: None,
+            preferences_pending: false,
+            deferred_exit: false,
+            source_cache: syntax::SourceCache::default(),
+            output_pending: String::new(),
             project: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             project_entries: Vec::new(),
             project_error: None,
@@ -230,20 +244,16 @@ impl App {
         ));
     }
     fn append(&mut self, text: &str) {
-        const LIMIT: usize = 1024 * 1024;
-        self.output.push_str(text);
+        self.output_pending.push_str(text);
         if !text.is_empty() {
             self.follow_console = true;
         }
-        if self.output.len() > LIMIT {
-            let mut cut = self.output.len() - LIMIT;
-            while !self.output.is_char_boundary(cut) {
-                cut += 1;
-            }
-            self.output.drain(..cut);
-            self.output.insert_str(0, "[Earlier output truncated]\n");
-        }
     }
+    fn flush_output(&mut self) {
+        console::append_batch(&mut self.output, &self.output_pending);
+        self.output_pending.clear();
+    }
+
     fn submit(&mut self) {
         let text = self.input.clone();
         if self.submit_text(text, false) {
@@ -504,70 +514,118 @@ impl App {
         } else {
             self.project.join(path)
         };
-        let result = match action {
-            PathAction::Open => self.editor.open(path),
-            PathAction::SaveAs => self.editor.current_mut().save(&path),
-            PathAction::Project => std::fs::canonicalize(path).and_then(|p| {
-                if p.is_dir() {
-                    self.project = p;
-                    self.refresh_project();
-                    Ok(())
-                } else {
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        "Not a directory",
-                    ))
-                }
-            }),
-            PathAction::ImportData => match import_command(&path, &self.import_name) {
-                Ok(command) => {
-                    if self.submit_text(command, false) {
-                        Ok(())
-                    } else {
-                        Err(std::io::Error::other("R is not ready to import data."))
+        let task = match action {
+            PathAction::Open => file_worker::Task::Open(path),
+            PathAction::SaveAs => file_worker::Task::Save(self.editor.current().clone(), path),
+            PathAction::Project => file_worker::Task::List(path),
+            PathAction::ImportData => {
+                match import_command(&path, &self.import_name) {
+                    Ok(command) => {
+                        if self.submit_text(command, false) {
+                            self.path_action = None;
+                        } else {
+                            self.message = Some("R is not ready to import data.".into());
+                        }
                     }
+                    Err(error) => self.message = Some(error),
                 }
-                Err(error) => Err(std::io::Error::other(error)),
+                return;
+            }
+            PathAction::ExportPlot => match self.plots.export_snapshot(&path) {
+                Ok(png) => file_worker::Task::ExportPlot(path, png),
+                Err(error) => {
+                    self.message = Some(error);
+                    return;
+                }
             },
-            PathAction::ExportPlot => self.plots.export(&path).map_err(std::io::Error::other),
         };
-        match result {
-            Ok(()) => self.path_action = None,
-            Err(error) => self.message = Some(error.to_string()),
+        if self.queue_file(task) {
+            self.path_action = None;
+        }
+    }
+    fn queue_file(&mut self, task: file_worker::Task) -> bool {
+        if self.file_busy {
+            self.message = Some("A file operation is still in progress.".into());
+            return false;
+        }
+        match self.files.submit(task) {
+            Ok(()) => {
+                self.file_busy = true;
+                true
+            }
+            Err(error) => {
+                self.message = Some(error);
+                false
+            }
         }
     }
     fn refresh_project(&mut self) {
-        match fs::read_dir(&self.project) {
-            Ok(entries) => {
-                self.project_error = None;
-                self.project_entries = entries
-                    .take(10_000)
-                    .filter_map(Result::ok)
-                    .filter_map(|entry| {
-                        let kind = entry.file_type().ok()?;
-                        if kind.is_file() || kind.is_dir() {
-                            Some((entry.path(), kind.is_dir()))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect();
-                self.project_entries
-                    .sort_by(|a, b| a.0.file_name().cmp(&b.0.file_name()));
-            }
-            Err(error) => {
-                self.project_entries.clear();
-                self.project_error = Some(error.to_string());
-            }
-        }
+        self.queue_file(file_worker::Task::List(self.project.clone()));
     }
     fn save_current(&mut self) {
         if let Some(path) = self.editor.current().path.clone() {
-            if let Err(error) = self.editor.current_mut().save(&path) {
-                self.message = Some(error.to_string());
-            }
+            self.queue_file(file_worker::Task::Save(self.editor.current().clone(), path));
         } else {
             self.ask_path(PathAction::SaveAs);
+        }
+    }
+    fn poll_files(&mut self) {
+        for event in self.files.poll() {
+            let result = match event {
+                file_worker::Event::Open(result) => {
+                    self.file_busy = false;
+                    result.map(|buffer| self.editor.accept_open(buffer))
+                }
+                file_worker::Event::Save(result) => {
+                    self.file_busy = false;
+                    result.map(|buffer| self.editor.accept_save(buffer))
+                }
+                file_worker::Event::List(result) => {
+                    self.file_busy = false;
+                    match result {
+                        Ok((path, entries)) => {
+                            self.project = path;
+                            self.project_entries = entries;
+                            self.project_error = None;
+                        }
+                        Err(error) => self.project_error = Some(error.to_string()),
+                    }
+                    Ok(())
+                }
+                file_worker::Event::ExportPlot(result) => {
+                    self.file_busy = false;
+                    result
+                }
+                file_worker::Event::Preferences(result) => {
+                    self.preferences_pending = false;
+                    result.map_err(|e| {
+                        std::io::Error::other(format!("Could not save preferences: {e}"))
+                    })
+                }
+            };
+            if let Err(error) = result {
+                self.message = Some(error.to_string());
+            }
+        }
+    }
+    fn queue_preferences(&mut self) {
+        if self.preferences_pending {
+            return;
+        }
+        let prefs = settings::Settings {
+            dark: self.dark,
+            font_size: self.font_size,
+            console_fraction: self.console_fraction,
+        };
+        match self.files.submit(file_worker::Task::Preferences(prefs)) {
+            Ok(()) => {
+                self.preferences_pending = true;
+                self.preferences_changed = None;
+            }
+            Err(error) => {
+                self.message = Some(error);
+                self.preferences_changed = None;
+            }
         }
     }
     fn poll(&mut self, ctx: &egui::Context) {
@@ -722,6 +780,7 @@ impl App {
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll(ctx);
+        self.poll_files();
         if self.refresh_environment && self.state == State::Ready {
             self.request_environment();
         }
@@ -755,13 +814,35 @@ impl eframe::App for App {
             self.show_assistant = true;
         }
         let previous_settings = (self.dark, self.font_size, self.console_fraction);
-        if ctx.input(|i| i.viewport().close_requested())
-            && self.editor.any_dirty()
-            && !self.allow_exit
-        {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.confirm_exit = true;
+        let close_requested = ctx.input(|i| i.viewport().close_requested());
+        if close_requested || self.deferred_exit {
+            if self.editor.any_dirty() && !self.allow_exit {
+                ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                self.confirm_exit = true;
+                self.deferred_exit = false;
+            } else {
+                if self.preferences_changed.is_some() {
+                    self.queue_preferences();
+                }
+                if self.file_busy || self.preferences_pending || self.preferences_changed.is_some()
+                {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    self.deferred_exit = true;
+                } else if !matches!(self.state, State::Stopped | State::Failed) {
+                    // Keep pumping UI events while the supervisor stops/reaps R.
+                    // Drop still provides immediate cancellation for a restart.
+                    if let Some(session) = &self.session {
+                        session.stop();
+                    }
+                    ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+                    self.deferred_exit = true;
+                } else if self.deferred_exit {
+                    self.deferred_exit = false;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
         }
+        self.flush_output();
         if self.path_action.is_none()
             && self.message.is_none()
             && self.close_buffer.is_none()
@@ -838,8 +919,13 @@ impl eframe::App for App {
                 if ui.button("Restart R…").clicked() {
                     self.confirm_restart = true;
                 }
+                if self.file_busy {
+                    ui.spinner();
+                    ui.weak("File operation in progress…");
+                }
                 if ui.button("Clear output").clicked() {
                     self.output.clear();
+                    self.output_pending.clear();
                 }
                 if ui
                     .button(if self.dark {
@@ -1066,8 +1152,7 @@ impl eframe::App for App {
                         if ui.button("Up").clicked()
                             && let Some(parent) = self.project.parent()
                         {
-                            self.project = parent.to_owned();
-                            self.refresh_project();
+                            self.queue_file(file_worker::Task::List(parent.to_owned()));
                         }
                         if ui.button("Refresh").clicked() {
                             self.refresh_project();
@@ -1088,13 +1173,10 @@ impl eframe::App for App {
                                 let name = name.to_string_lossy();
                                 if *is_dir {
                                     if ui.button(format!("📁 {name}/")).clicked() {
-                                        self.project = path.clone();
-                                        self.refresh_project();
+                                        self.queue_file(file_worker::Task::List(path.clone()));
                                     }
-                                } else if ui.button(name).clicked()
-                                    && let Err(error) = self.editor.open(path.clone())
-                                {
-                                    self.message = Some(error.to_string());
+                                } else if ui.button(name).clicked() {
+                                    self.queue_file(file_worker::Task::Open(path.clone()));
                                 }
                             }
                             if entries.len() > 300 {
@@ -1153,7 +1235,10 @@ impl eframe::App for App {
                 if ui.button("Save as…").clicked() {
                     self.ask_path(PathAction::SaveAs);
                 }
-                if ui.button("Close").clicked() {
+                if ui
+                    .add_enabled(!self.file_busy, egui::Button::new("Close"))
+                    .clicked()
+                {
                     if self.editor.current().dirty() {
                         self.close_buffer = Some(self.editor.current().id);
                     } else {
@@ -1223,6 +1308,7 @@ impl eframe::App for App {
             ui.separator();
             let dark = self.dark;
             let size = self.font_size;
+            let cache = &mut self.source_cache;
             let buffer = self.editor.current_mut();
             let id = egui::Id::new(("source_editor", buffer.id));
             let mut run = false;
@@ -1230,19 +1316,14 @@ impl eframe::App for App {
                 .id_salt("source_scroll")
                 .show(ui, |ui| {
                     ui.horizontal_top(|ui| {
-                        let lines = buffer.text.lines().count()
-                            + usize::from(buffer.text.is_empty() || buffer.text.ends_with('\n'));
-                        let numbers = (1..=lines).map(|n| format!("{n}\n")).collect::<String>();
                         ui.label(
-                            RichText::new(numbers)
+                            RichText::new(cache.line_numbers(&buffer.text))
                                 .font(egui::FontId::monospace(size))
                                 .weak(),
                         );
                         let mut layouter =
                             |ui: &egui::Ui, text: &dyn egui::TextBuffer, _wrap_width: f32| {
-                                let mut job = syntax::highlight(text.as_str(), dark, size);
-                                job.wrap.max_width = f32::INFINITY;
-                                ui.fonts_mut(|fonts| fonts.layout_job(job))
+                                cache.layout(ui, text.as_str(), dark, size)
                             };
                         let response = egui::TextEdit::multiline(&mut buffer.text)
                             .id(id)
@@ -1351,14 +1432,13 @@ impl eframe::App for App {
                 });
         }
         if previous_settings != (self.dark, self.font_size, self.console_fraction) {
-            let prefs = settings::Settings {
-                dark: self.dark,
-                font_size: self.font_size,
-                console_fraction: self.console_fraction,
-            };
-            if let Err(error) = prefs.save() {
-                self.message = Some(format!("Could not save preferences: {error}"));
-            }
+            self.preferences_changed = Some(Instant::now());
+        }
+        if self
+            .preferences_changed
+            .is_some_and(|changed| changed.elapsed() >= Duration::from_millis(500))
+        {
+            self.queue_preferences();
         }
         if self.confirm_restart {
             egui::Window::new("Restart R?").collapsible(false).resizable(false).show(ctx, |ui| {

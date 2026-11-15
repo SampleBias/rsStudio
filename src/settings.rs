@@ -3,6 +3,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
+#[derive(Clone, Copy)]
 pub struct Settings {
     pub dark: bool,
     pub font_size: f32,

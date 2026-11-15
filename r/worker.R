@@ -232,7 +232,7 @@ repeat {
     next
   }
   if (request$kind %in% c("PACKAGES", "INSTALL", "LOAD")) {
-    result <- tryCatch({
+    result <- tryCatch(with_live_warnings({
       if (identical(request$kind, "PACKAGES")) {
         names <- strsplit(request$payload, "\n", fixed = TRUE)[[1L]]
         send_message("STATUS", request$id, package_status(names))
@@ -249,7 +249,7 @@ repeat {
       }
       flush(stdout()); flush(stderr())
       NULL
-    }, error = identity)
+    }), error = identity)
     if (inherits(result, "error")) send_message("ERROR", request$id, conditionMessage(result))
     next
   }
@@ -266,7 +266,7 @@ repeat {
     send_message(kind, request$id, message)
     next
   }
-  err <- tryCatch({
+  err <- tryCatch(with_live_warnings({
     plot_request <- request$id
     for (expression in parsed) {
       result <- withVisible(eval(expression, envir = .GlobalEnv))
@@ -276,7 +276,7 @@ repeat {
       flush(stderr())
     }
     NULL
-  }, error = identity)
+  }), error = identity)
   tryCatch(capture_plot(), error = function(e) cat("[Plot error]", conditionMessage(e), "\n", file = stderr()))
   plot_request <- NULL
   if (inherits(err, "error")) send_message("ERROR", request$id, conditionMessage(err))
