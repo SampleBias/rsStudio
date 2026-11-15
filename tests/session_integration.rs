@@ -132,6 +132,10 @@ fn persistent_session_recovers_and_restarts() {
     assert!(started.elapsed() < Duration::from_secs(3));
     let next = Session::start(executable.display().to_string(), std::env::temp_dir());
     wait_for(&next, |e| matches!(e, Event::Ready { .. }));
+    let stopping = Instant::now();
+    next.stop();
+    wait_for(&next, |e| matches!(e, Event::Exited));
+    assert!(stopping.elapsed() < Duration::from_secs(2));
     drop(next);
 }
 
@@ -435,5 +439,106 @@ fn real_r_plots_are_captured_with_layers_and_history() {
         overlay
             .iter()
             .all(|(page, _)| *page == fresh.last().unwrap().0)
+    );
+}
+
+#[test]
+fn real_r_warning_options_without_network() {
+    let result = std::process::Command::new("R")
+        .args(["--vanilla", "--slave", "-f", "tests/r_warnings.R"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output();
+    let output = match result {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            assert!(
+                std::env::var_os("RSSTUDIO_REQUIRE_R").is_none(),
+                "R is required"
+            );
+            eprintln!("Skipping warning checks: R is not installed");
+            return;
+        }
+        Err(error) => panic!("Cannot execute R: {error}"),
+    };
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn real_r_warning_arrives_during_evaluation() {
+    if !network_available() {
+        return;
+    }
+    if std::process::Command::new("R")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        assert!(
+            std::env::var_os("RSSTUDIO_REQUIRE_R").is_none(),
+            "R is required"
+        );
+        eprintln!("Skipping warning timing check: R is not installed");
+        return;
+    }
+    let session = Session::start("R".into(), std::env::temp_dir());
+    wait_for(&session, |e| matches!(e, Event::Ready { .. }));
+    session
+        .evaluate(1, "sqrt(-1); Sys.sleep(1)".into())
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let mut saw_warning = false;
+    loop {
+        for event in session.poll() {
+            match event {
+                Event::Output(text) if text.contains("NaNs produced") => saw_warning = true,
+                Event::Done(1) => {
+                    assert!(saw_warning, "Warning was deferred until after completion");
+                    return;
+                }
+                Event::Failed(message) | Event::Error(1, message) => panic!("R failed: {message}"),
+                _ => {}
+            }
+        }
+        assert!(Instant::now() < deadline, "Warning timing check timed out");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn generated_r_worker_runs_without_network() {
+    let path = std::env::temp_dir().join(format!(
+        "rsstudio-worker-source-{}-{:?}.R",
+        std::process::id(),
+        std::thread::current().id()
+    ));
+    fs::write(&path, session::worker_source()).unwrap();
+    let result = std::process::Command::new("R")
+        .args(["--vanilla", "--slave", "-f", "tests/r_worker.R", "--args"])
+        .arg(&path)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output();
+    fs::remove_file(path).unwrap();
+    let output = match result {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            assert!(
+                std::env::var_os("RSSTUDIO_REQUIRE_R").is_none(),
+                "R is required"
+            );
+            eprintln!("Skipping generated worker checks: R is not installed");
+            return;
+        }
+        Err(error) => panic!("Cannot execute R: {error}"),
+    };
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
     );
 }

@@ -1,5 +1,5 @@
 //! Script buffers, bounded file I/O, and selection handling.
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 const MAX_FILE: u64 = 2 * 1024 * 1024;
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Buffer {
     pub id: u64,
     pub path: Option<PathBuf>,
@@ -28,6 +28,20 @@ impl Buffer {
             disk: None,
             cursor: (0, 0),
         }
+    }
+    pub fn read(path: PathBuf) -> io::Result<Self> {
+        let path = fs::canonicalize(path)?;
+        let bytes = read_file(&path)?;
+        let text = String::from_utf8(bytes.clone())
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "File is not valid UTF-8"))?;
+        Ok(Self {
+            id: 0,
+            path: Some(path),
+            saved: text.clone(),
+            text,
+            disk: Some(bytes),
+            cursor: (0, 0),
+        })
     }
     pub fn name(&self) -> String {
         self.path
@@ -107,30 +121,28 @@ impl Editor {
         self.next_id += 1;
         self.active = self.buffers.len() - 1;
     }
+    #[cfg(test)]
     pub fn open(&mut self, path: PathBuf) -> io::Result<()> {
-        let path = fs::canonicalize(path)?;
-        if let Some(index) = self
-            .buffers
-            .iter()
-            .position(|buffer| buffer.path.as_ref() == Some(&path))
-        {
-            self.active = index;
-            return Ok(());
-        }
-        let bytes = read_file(&path)?;
-        let text = String::from_utf8(bytes.clone())
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "File is not valid UTF-8"))?;
-        self.buffers.push(Buffer {
-            id: self.next_id,
-            path: Some(path),
-            saved: text.clone(),
-            text,
-            disk: Some(bytes),
-            cursor: (0, 0),
-        });
-        self.next_id += 1;
-        self.active = self.buffers.len() - 1;
+        self.accept_open(Buffer::read(path)?);
         Ok(())
+    }
+    pub fn accept_open(&mut self, mut buffer: Buffer) {
+        if let Some(index) = self.buffers.iter().position(|b| b.path == buffer.path) {
+            self.active = index;
+            return;
+        }
+        buffer.id = self.next_id;
+        self.next_id += 1;
+        self.buffers.push(buffer);
+        self.active = self.buffers.len() - 1;
+    }
+    pub fn accept_save(&mut self, snapshot: Buffer) {
+        if let Some(buffer) = self.buffers.iter_mut().find(|b| b.id == snapshot.id) {
+            // Edits made during a background save remain dirty.
+            buffer.path = snapshot.path;
+            buffer.saved = snapshot.saved;
+            buffer.disk = snapshot.disk;
+        }
     }
     pub fn close(&mut self, index: usize) {
         self.buffers.remove(index);
@@ -152,7 +164,21 @@ fn char_byte(text: &str, pos: usize) -> usize {
 }
 
 fn read_file(path: &Path) -> io::Result<Vec<u8>> {
-    let file = File::open(path)?;
+    if !fs::metadata(path)?.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "Not a regular file",
+        ));
+    }
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // O_NONBLOCK also closes the metadata/open race if a FIFO replaces the file.
+        options.custom_flags(0x800);
+    }
+    let file = options.open(path)?;
     if !file.metadata()?.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -328,5 +354,53 @@ mod tests {
         assert_eq!(editor.buffers.len(), 2);
         assert_eq!(editor.current().text, "unsaved");
         assert!(editor.any_dirty());
+    }
+}
+
+#[cfg(test)]
+mod background_tests {
+    use super::*;
+    #[test]
+    fn saving_a_snapshot_preserves_new_edits_and_active_tab() {
+        let path = std::env::temp_dir().join(format!(
+            "rsstudio-snapshot-{}-{}.R",
+            std::process::id(),
+            TEMP_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut editor = Editor::new();
+        editor.current_mut().text = "original".into();
+        let mut snapshot = editor.current().clone();
+        editor.current_mut().text = "edited during save".into();
+        editor.new_buffer();
+        snapshot.save(&path).unwrap();
+        editor.accept_save(snapshot);
+        assert_eq!(editor.active, 1);
+        assert_eq!(editor.buffers[0].text, "edited during save");
+        assert!(editor.buffers[0].dirty());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "original");
+        // The disk snapshot must also advance so the next save succeeds.
+        editor.buffers[0].save(&path).unwrap();
+        assert!(!editor.buffers[0].dirty());
+        fs::remove_file(path).unwrap();
+    }
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn opening_a_fifo_is_rejected_without_a_writer() {
+        let path = std::env::temp_dir().join(format!("rsstudio-fifo-{}", std::process::id()));
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let read_path = path.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(Buffer::read(read_path));
+        });
+        let result = rx.recv_timeout(std::time::Duration::from_secs(1));
+        fs::remove_file(path).unwrap();
+        assert!(result.expect("Opening a FIFO blocked").is_err());
     }
 }

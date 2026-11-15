@@ -44,6 +44,7 @@ pub fn catalog() -> Vec<Package> {
         ("shiny", "Interactive applications", Cran),
         ("plotly", "Interactive plots", Cran),
         ("BiocManager", "Bioconductor installer", Cran),
+        ("BiocVersion", "Bioconductor release marker", Bio),
         ("DESeq2", "Differential expression", Bio),
         ("limma", "Gene expression analysis", Bio),
     ]

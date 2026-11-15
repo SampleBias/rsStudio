@@ -52,7 +52,7 @@ impl Plots {
         Ok(())
     }
 
-    pub fn export(&self, path: &Path) -> Result<(), String> {
+    pub fn export_snapshot(&self, path: &Path) -> Result<Vec<u8>, String> {
         let plot = self.history.get(self.current).ok_or("No plot to export.")?;
         if !path
             .extension()
@@ -61,13 +61,19 @@ impl Plots {
         {
             return Err("Use a .png filename for plot export.".into());
         }
+        Ok(plot.png.clone())
+    }
+    pub fn write_export(path: &Path, png: &[u8]) -> std::io::Result<()> {
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(path)
-            .map_err(|e| format!("Cannot export plot: {e}"))?;
-        file.write_all(&plot.png)
-            .map_err(|e| format!("Cannot write plot: {e}"))
+            .open(path)?;
+        file.write_all(png)
+    }
+    #[cfg(test)]
+    fn export(&self, path: &Path) -> Result<(), String> {
+        let png = self.export_snapshot(path)?;
+        Self::write_export(path, &png).map_err(|e| e.to_string())
     }
 
     /// Draw the pane, returning true when the user requests a PNG export.

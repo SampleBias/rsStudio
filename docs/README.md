@@ -10,6 +10,10 @@ rsStudio is the working name for an independently developed, Linux-first R IDE. 
 4. [Quality, security, and delivery](quality-and-delivery.md) — verification, packaging, and licensing.
 5. Phase briefs: [01 Foundation](phases/01-foundation.md), [02 Authoring](phases/02-authoring.md), [03 Inspect and plot](phases/03-inspect-and-plot.md), [04 MVP release](phases/04-mvp-release.md), and [05 Later platforms](phases/05-later-platforms.md).
 
+## Implementation notes
+
+- [Backend stabilization](backend-stability.md) — approved changes, regression checks, measurements, and remaining validation.
+
 ## Planning conventions
 
 - Each phase has a demo, deliverables, and verifiable exit criteria. Tasks are proposals until implemented; no dates or estimates are assumed.
