@@ -2,6 +2,7 @@ mod agent;
 mod clipboard_image;
 mod completion;
 mod console;
+mod cran;
 mod editor;
 mod file_worker;
 mod packages;
@@ -227,6 +228,7 @@ struct App {
     find_text: String,
     output_tab: OutputTab,
     packages: Vec<packages::Package>,
+    package_info: cran::Lookup,
     package_status: std::collections::BTreeMap<String, packages::Status>,
     package_filter: String,
     package_name: String,
@@ -299,6 +301,7 @@ impl App {
             find_text: String::new(),
             output_tab: OutputTab::Plots,
             packages: packages::catalog(),
+            package_info: cran::Lookup::default(),
             package_status: std::collections::BTreeMap::new(),
             package_filter: String::new(),
             package_name: String::new(),
@@ -397,6 +400,13 @@ impl App {
         if self.state != State::Ready {
             return;
         }
+        if let PackageOperation::Install(name) = &operation
+            && self.package_info.get(name).is_some()
+        {
+            // Retry a failed manual-package lookup when installation is retried;
+            // successful and in-flight lookups are deduplicated by the cache.
+            self.package_info.request(name);
+        }
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1).max(1);
         let Some(session) = &self.session else {
@@ -440,6 +450,63 @@ impl App {
             }
         }
     }
+    fn add_package(&mut self) {
+        let name = self.package_name.trim().to_owned();
+        if !packages::valid_name(&name) {
+            self.package_notice =
+                "Enter a valid R package name (letters, numbers, and dots).".into();
+        } else if self.packages.iter().any(|p| p.name == name) {
+            self.package_filter = name;
+            self.package_notice = "Package is already in the list.".into();
+        } else if self.packages.len() >= 200 {
+            self.package_notice = "The package list is full.".into();
+        } else {
+            self.packages.push(packages::Package {
+                name: name.clone(),
+                description: if self.package_bioc {
+                    "Bioconductor package"
+                } else {
+                    "CRAN package"
+                },
+                repository: if self.package_bioc {
+                    packages::Repository::Bioconductor
+                } else {
+                    packages::Repository::Cran
+                },
+                is_default: false,
+            });
+            if !self.package_bioc {
+                self.package_info.request(&name);
+            }
+            self.package_filter = name;
+            self.package_name.clear();
+            self.refresh_packages = true;
+        }
+    }
+    fn can_remove_package(&self, name: &str) -> bool {
+        self.packages
+            .iter()
+            .any(|p| p.name == name && !p.is_default)
+            && match &self.pending_package {
+                // A status reply must still match the package list it queried.
+                Some(PackageOperation::Query) => false,
+                Some(PackageOperation::Install(active) | PackageOperation::Load(active)) => {
+                    active != name
+                }
+                None => true,
+            }
+    }
+    fn remove_package(&mut self, name: &str) {
+        if !self.can_remove_package(name) {
+            return;
+        }
+        self.packages.retain(|p| p.name != name);
+        self.package_status.remove(name);
+        self.package_info.forget(name);
+        if self.package_filter.trim() == name {
+            self.package_filter.clear();
+        }
+    }
     fn packages_ui(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.strong("R packages");
@@ -478,95 +545,134 @@ impl App {
                 .add_enabled(self.state == State::Ready, egui::Button::new("Add"))
                 .clicked()
             {
-                let name = self.package_name.trim();
-                if !packages::valid_name(name) {
-                    self.package_notice =
-                        "Enter a valid R package name (letters, numbers, and dots).".into();
-                } else if self.packages.iter().any(|p| p.name == name) {
-                    self.package_filter = name.to_owned();
-                    self.package_notice = "Package is already in the list.".into();
-                } else if self.packages.len() >= 200 {
-                    self.package_notice = "The package list is full.".into();
-                } else {
-                    self.packages.push(packages::Package {
-                        name: name.to_owned(),
-                        description: "Custom package",
-                        repository: if self.package_bioc {
-                            packages::Repository::Bioconductor
-                        } else {
-                            packages::Repository::Cran
-                        },
-                    });
-                    self.package_filter = name.to_owned();
-                    self.package_name.clear();
-                    self.refresh_packages = true;
-                }
+                self.add_package();
             }
         });
         ui.separator();
         let filter = self.package_filter.to_lowercase();
         let entries = self.packages.clone();
         let mut action = None;
+        let mut retry = None;
+        let mut remove = None;
         egui::ScrollArea::vertical()
             .id_salt("package_list")
+            .auto_shrink([false, true])
             .show(ui, |ui| {
+                // Floating scrollbars expand over the content. Reserve their
+                // full width and a gap so the remove button stays reachable.
+                let scroll = ui.spacing().scroll;
+                let gutter = ui.spacing().item_spacing.x
+                    + if scroll.floating { scroll.bar_width + scroll.bar_outer_margin } else { 0.0 };
+                ui.set_max_width((ui.available_width() - gutter).max(0.0));
                 for package in entries.iter().filter(|p| {
                     p.name.to_lowercase().contains(&filter)
                         || p.description.to_lowercase().contains(&filter)
+                        || matches!(self.package_info.get(&p.name), Some(cran::State::Ready(info))
+                            if info.title.to_lowercase().contains(&filter)
+                                || info.description.to_lowercase().contains(&filter))
                 }) {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.strong(&package.name);
-                        ui.weak(package.description);
-                        if package.repository == packages::Repository::Bioconductor {
-                            ui.small("Bioconductor");
-                        }
-                        match self.package_status.get(&package.name) {
-                            Some(status) if status.loaded => {
-                                ui.label(format!(
-                                    "Loaded {}",
-                                    status.version.as_deref().unwrap_or("")
-                                ));
+                    ui.push_id(&package.name, |ui| {
+                        // Reserve the right edge first so descriptions can wrap
+                        // without displacing the remove control.
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+                            if !package.is_default
+                                && ui.add_enabled(
+                                    self.can_remove_package(&package.name),
+                                    egui::Button::new(RichText::new("×").size(14.0).weak())
+                                        .small().frame(false),
+                                )
+                                .on_hover_text("Remove from list (keeps the installed package)")
+                                .on_disabled_hover_text("Wait for the package operation to finish.")
+                                .clicked()
+                            {
+                                remove = Some(package.name.clone());
                             }
-                            Some(status) if status.version.is_some() => {
-                                ui.label(format!(
-                                    "Installed {}",
-                                    status.version.as_deref().unwrap_or("")
-                                ));
-                                if ui
-                                    .add_enabled(
-                                        self.state == State::Ready,
-                                        egui::Button::new("Load"),
-                                    )
-                                    .clicked()
-                                {
-                                    action = Some(PackageOperation::Load(package.name.clone()));
-                                }
-                            }
-                            Some(_) if package.repository == packages::Repository::Bundled => {
-                                ui.weak("Bundled with R; unavailable in this installation");
-                            }
-                            Some(_) => {
-                                ui.weak("Not installed");
-                                if ui
-                                    .add_enabled(
-                                        self.state == State::Ready,
-                                        egui::Button::new("Install"),
-                                    )
-                                    .clicked()
-                                {
-                                    action = Some(PackageOperation::Install(package.name.clone()));
-                                }
-                            }
-                            None => {
-                                ui.weak("Status unknown");
-                            }
-                        }
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(ui.available_width(), 0.0),
+                                egui::Layout::left_to_right(egui::Align::Center).with_main_wrap(true),
+                                |ui| {
+                                    ui.strong(&package.name);
+                                    match self.package_info.get(&package.name) {
+                                        Some(cran::State::Ready(info)) => {
+                                            ui.weak(&info.title).on_hover_text(&info.description);
+                                            ui.hyperlink_to("CRAN", cran::package_url(&package.name));
+                                        }
+                                        Some(cran::State::Loading) => {
+                                            ui.spinner();
+                                            ui.weak("Looking up CRAN…");
+                                        }
+                                        Some(state @ (cran::State::Missing | cran::State::Failed(_))) => {
+                                            let (label, detail) = match state {
+                                                cran::State::Missing => ("Not found on CRAN", "Check the package name; it may be archived or hosted in another repository."),
+                                                cran::State::Failed(error) => ("CRAN information unavailable", error.as_str()),
+                                                _ => unreachable!(),
+                                            };
+                                            ui.weak(label).on_hover_text(detail);
+                                            if ui.small_button("Retry lookup").clicked() {
+                                                retry = Some(package.name.clone());
+                                            }
+                                        }
+                                        None => { ui.weak(package.description); }
+                                    }
+                                    if package.repository == packages::Repository::Bioconductor {
+                                        ui.small("Bioconductor");
+                                    }
+                                    match self.package_status.get(&package.name) {
+                                        Some(status) if status.loaded => {
+                                            ui.label(format!(
+                                                "Loaded {}",
+                                                status.version.as_deref().unwrap_or("")
+                                            ));
+                                        }
+                                        Some(status) if status.version.is_some() => {
+                                            ui.label(format!(
+                                                "Installed {}",
+                                                status.version.as_deref().unwrap_or("")
+                                            ));
+                                            if ui
+                                                .add_enabled(
+                                                    self.state == State::Ready,
+                                                    egui::Button::new("Load"),
+                                                )
+                                                .clicked()
+                                            {
+                                                action = Some(PackageOperation::Load(package.name.clone()));
+                                            }
+                                        }
+                                        Some(_) if package.repository == packages::Repository::Bundled => {
+                                            ui.weak("Bundled with R; unavailable in this installation");
+                                        }
+                                        Some(_) => {
+                                            ui.weak("Not installed");
+                                            if ui
+                                                .add_enabled(
+                                                    self.state == State::Ready,
+                                                    egui::Button::new("Install"),
+                                                )
+                                                .clicked()
+                                            {
+                                                action = Some(PackageOperation::Install(package.name.clone()));
+                                            }
+                                        }
+                                        None => {
+                                            ui.weak("Status unknown");
+                                        }
+                                    }
+                                },
+                            );
+                        });
                     });
                     ui.separator();
                 }
             });
         if let Some(operation) = action {
             self.package_request(operation);
+        }
+        if let Some(name) = retry {
+            self.package_info.request(&name);
+        }
+        if let Some(name) = remove {
+            self.remove_package(&name);
         }
     }
     fn request_completion(&mut self, key: completion::Key) {
@@ -962,6 +1068,7 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll(ctx);
         self.poll_files();
+        self.package_info.poll();
         if self.refresh_environment && self.state == State::Ready {
             self.request_environment();
         }
@@ -2319,5 +2426,298 @@ mod assistant_import_tests {
             "{}",
             app.output_pending
         );
+    }
+}
+
+#[cfg(test)]
+mod package_metadata_tests {
+    use super::*;
+
+    fn app(ctx: &egui::Context) -> App {
+        let mut app = App::new(settings::Settings::default(), ctx);
+        app.session.take();
+        app.state = State::Stopped;
+        app.refresh_environment = false;
+        app.package_info = cran::Lookup::with_fetch(|_| {
+            cran::State::Ready(cran::Metadata {
+                title: "Neural tensor models".into(),
+                description: "Tensor utilities with automatic differentiation.".into(),
+            })
+        });
+        app
+    }
+
+    #[test]
+    fn manually_added_cran_package_displays_metadata_and_searches_its_description() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        app.package_name = " torch ".into();
+        app.add_package();
+        assert_eq!(app.packages.last().unwrap().name, "torch");
+        assert!(matches!(
+            app.package_info.get("torch"),
+            Some(cran::State::Loading)
+        ));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !matches!(app.package_info.get("torch"), Some(cran::State::Ready(_))) {
+            app.package_info.poll();
+            assert!(
+                Instant::now() < deadline,
+                "Metadata lookup did not complete"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        app.package_filter = "automatic".into();
+        app.package_status.insert(
+            "torch".into(),
+            packages::Status {
+                version: None,
+                loaded: false,
+            },
+        );
+        let output = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| app.packages_ui(ui));
+        });
+        fn labels(shape: &egui::Shape, text: &mut String) {
+            match shape {
+                egui::Shape::Text(shape) => {
+                    text.push_str(&shape.galley.job.text);
+                    text.push('\n');
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        labels(shape, text);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut text = String::new();
+        for shape in &output.shapes {
+            labels(&shape.shape, &mut text);
+        }
+        assert!(text.contains("torch"), "{text}");
+        assert!(text.contains("Neural tensor models"), "{text}");
+        assert!(text.contains("Not installed"), "{text}");
+        assert!(!text.contains("Custom package"));
+        assert!(app.pending_id.is_none());
+        assert!(app.input.is_empty());
+        assert!(matches!(app.state, State::Stopped));
+    }
+
+    #[test]
+    fn bioconductor_and_invalid_names_do_not_start_cran_lookups() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        app.package_bioc = true;
+        app.package_name = "edgeR".into();
+        app.add_package();
+        let package = app.packages.last().unwrap();
+        assert!(package.repository == packages::Repository::Bioconductor);
+        assert_eq!(package.description, "Bioconductor package");
+        assert!(app.package_info.get("edgeR").is_none());
+        let count = app.packages.len();
+        app.package_bioc = false;
+        app.package_name = "../../invalid".into();
+        app.add_package();
+        assert_eq!(app.packages.len(), count);
+        assert!(app.package_info.get("../../invalid").is_none());
+    }
+
+    fn package_frame(
+        app: &mut App,
+        ctx: &egui::Context,
+        width: f32,
+        events: Vec<egui::Event>,
+    ) -> Vec<egui::Rect> {
+        package_frame_at_height(app, ctx, width, 600.0, events)
+    }
+
+    fn package_frame_at_height(
+        app: &mut App,
+        ctx: &egui::Context,
+        width: f32,
+        height: f32,
+        events: Vec<egui::Event>,
+    ) -> Vec<egui::Rect> {
+        let output = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(width, height),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| app.packages_ui(ui));
+            },
+        );
+        fn collect(shape: &egui::Shape, rects: &mut Vec<egui::Rect>) {
+            match shape {
+                egui::Shape::Text(text) if text.galley.job.text == "×" => {
+                    rects.push(text.galley.rect.translate(text.pos.to_vec2()))
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        collect(shape, rects);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut rects = Vec::new();
+        for shape in output.shapes {
+            collect(&shape.shape, &mut rects);
+        }
+        rects
+    }
+
+    #[test]
+    fn remove_button_is_small_at_the_right_only_for_added_packages_and_removes_on_click() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        app.package_name = "torch".into();
+        app.add_package();
+        app.package_bioc = true;
+        app.package_name = "edgeR".into();
+        app.add_package();
+        for width in [320.0, 800.0] {
+            for name in ["torch", "edgeR"] {
+                app.package_filter = name.into();
+                let buttons = package_frame(&mut app, &ctx, width, vec![]);
+                assert_eq!(buttons.len(), 1, "Missing remove control for {name}");
+                let button = buttons[0];
+                assert!(
+                    button.center().x > width - 35.0 && button.right() <= width,
+                    "Remove control left the right edge at width {width}: {button:?}"
+                );
+                assert!(button.width() < 20.0 && button.height() < 20.0);
+            }
+            for name in ["dplyr", "DESeq2"] {
+                app.package_filter = name.into();
+                assert!(
+                    package_frame(&mut app, &ctx, width, vec![]).is_empty(),
+                    "Default package {name} had a remove control"
+                );
+            }
+        }
+        app.package_filter = "torch".into();
+        app.package_status.insert(
+            "torch".into(),
+            packages::Status {
+                version: Some("1.0".into()),
+                loaded: true,
+            },
+        );
+        let button = package_frame(&mut app, &ctx, 320.0, vec![])[0];
+        let click = |pressed| {
+            vec![
+                egui::Event::PointerMoved(button.center()),
+                egui::Event::PointerButton {
+                    pos: button.center(),
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]
+        };
+        package_frame(&mut app, &ctx, 320.0, click(true));
+        package_frame(&mut app, &ctx, 320.0, click(false));
+        assert!(!app.packages.iter().any(|p| p.name == "torch"));
+        assert!(!app.package_status.contains_key("torch"));
+        assert!(app.package_info.get("torch").is_none());
+        assert!(app.package_filter.is_empty());
+        assert!(app.pending_package.is_none() && app.pending_id.is_none());
+        assert!(app.input.is_empty() && app.state == State::Stopped);
+        assert!(app.packages.iter().any(|p| p.name == "edgeR"));
+        assert!(app.packages.iter().filter(|p| p.is_default).count() == packages::catalog().len());
+    }
+
+    #[test]
+    fn removal_preserves_defaults_and_in_flight_package_operations() {
+        let ctx = egui::Context::default();
+        let mut app = app(&ctx);
+        app.package_name = "torch".into();
+        app.add_package();
+        app.package_bioc = true;
+        app.package_name = "edgeR".into();
+        app.add_package();
+        app.remove_package("dplyr");
+        assert!(app.packages.iter().any(|p| p.name == "dplyr"));
+        app.pending_id = Some(10);
+        app.pending_package = Some(PackageOperation::Query);
+        app.remove_package("torch");
+        assert!(app.packages.iter().any(|p| p.name == "torch"));
+        app.pending_package = Some(PackageOperation::Install("torch".into()));
+        app.remove_package("torch");
+        assert!(app.packages.iter().any(|p| p.name == "torch"));
+        app.remove_package("edgeR");
+        assert!(!app.packages.iter().any(|p| p.name == "edgeR"));
+        assert!(
+            matches!(&app.pending_package, Some(PackageOperation::Install(name)) if name == "torch")
+        );
+        assert_eq!(app.pending_id, Some(10));
+        app.pending_package = Some(PackageOperation::Load("torch".into()));
+        app.remove_package("torch");
+        assert!(app.packages.iter().any(|p| p.name == "torch"));
+        app.pending_id = None;
+        app.pending_package = None;
+        app.remove_package("torch");
+        assert!(!app.packages.iter().any(|p| p.name == "torch"));
+    }
+
+    #[test]
+    fn remove_button_stays_clear_of_the_expanded_scrollbar_and_remains_clickable() {
+        for width in [220.0, 320.0] {
+            let ctx = egui::Context::default();
+            ctx.style_mut(|style| style.animation_time = 0.0);
+            let mut app = app(&ctx);
+            app.package_name = "torch".into();
+            app.add_package();
+            let last = app.packages.len() - 1;
+            app.packages.swap(0, last);
+            app.package_filter.clear();
+            // The unfiltered list overflows this short pane, unlike the single-row
+            // views in the original remove-button test.
+            package_frame_at_height(&mut app, &ctx, width, 240.0, vec![]);
+            let button = package_frame_at_height(&mut app, &ctx, width, 240.0, vec![])[0];
+            let scrollbar_left = width - 8.0 - ctx.style().spacing.scroll.bar_width;
+            assert!(
+                button.right() <= scrollbar_left - 4.0,
+                "Remove button overlaps the scrollbar at width {width}: {button:?}"
+            );
+            package_frame_at_height(
+                &mut app,
+                &ctx,
+                width,
+                240.0,
+                vec![egui::Event::PointerMoved(egui::pos2(
+                    width - 10.0,
+                    button.center().y,
+                ))],
+            );
+            for pressed in [true, false] {
+                package_frame_at_height(
+                    &mut app,
+                    &ctx,
+                    width,
+                    240.0,
+                    vec![
+                        egui::Event::PointerMoved(button.center()),
+                        egui::Event::PointerButton {
+                            pos: button.center(),
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+            assert!(
+                !app.packages.iter().any(|p| p.name == "torch"),
+                "Scrollbar intercepted the remove click at width {width}"
+            );
+        }
     }
 }

@@ -12,6 +12,7 @@ pub struct Package {
     pub name: String,
     pub description: &'static str,
     pub repository: Repository,
+    pub is_default: bool,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Status {
@@ -53,6 +54,7 @@ pub fn catalog() -> Vec<Package> {
         name: name.into(),
         description,
         repository,
+        is_default: true,
     })
     .collect()
 }
@@ -129,11 +131,13 @@ mod tests {
                 name: "stats".into(),
                 description: "",
                 repository: Repository::Bundled,
+                is_default: true,
             },
             Package {
                 name: "dplyr".into(),
                 description: "",
                 repository: Repository::Cran,
+                is_default: true,
             },
         ];
         let status = parse_status("stats\t4.5.0\t1\ndplyr\t-\t0\n", &expected).unwrap();
