@@ -146,6 +146,52 @@ environment_snapshot <- function() {
   json_array(unlist(entries, use.names = FALSE))
 }
 
+# Completion returns names only; it never parses or evaluates editor text.
+completion_snapshot <- function(payload) {
+  parts <- strsplit(paste0(payload, "\t."), "\t", fixed = TRUE)[[1L]]
+  if (length(parts) != 4L) stop("Invalid completion request")
+  unhex <- function(value) {
+    if (!nzchar(value)) return("")
+    if (nchar(value, type = "bytes") > 4096L || nchar(value) %% 2L || grepl("[^0-9a-f]", value)) stop("Invalid completion text")
+    starts <- seq.int(1L, nchar(value), by = 2L)
+    result <- rawToChar(as.raw(strtoi(substring(value, starts, starts + 1L), base = 16L)))
+    Encoding(result) <- "UTF-8"
+    result
+  }
+  mode <- parts[1L]; owner <- unhex(parts[2L]); prefix <- unhex(parts[3L])
+  values <- character()
+  if (identical(mode, "symbols")) {
+    for (position in search()) {
+      env <- as.environment(position)
+      values <- c(values, ls(envir = env, all.names = TRUE))
+    }
+  } else if (identical(mode, "namespace")) {
+    if (owner %in% loadedNamespaces()) values <- getNamespaceExports(owner)
+  } else if (identical(mode, "members")) {
+    for (position in search()) {
+      env <- as.environment(position)
+      if (!exists(owner, envir = env, inherits = FALSE)) next
+      if (bindingIsActive(owner, env)) break
+      object <- get(owner, envir = env, inherits = FALSE)
+      if (is.matrix(object) || is.data.frame(object)) {
+        if (is.matrix(object)) {
+          dims <- attr(object, "dimnames", exact = TRUE)
+          if (length(dims) >= 2L) values <- dims[[2L]]
+        } else values <- attr(object, "names", exact = TRUE)
+      } else if (is.list(object)) values <- attr(object, "names", exact = TRUE)
+      break
+    }
+  } else stop("Invalid completion mode")
+  if (is.null(values)) values <- character()
+  values <- enc2utf8(values)
+  values <- values[!is.na(values) & nzchar(values)]
+  values <- values[startsWith(values, prefix) & nchar(values, type = "bytes") <= 512L]
+  values <- sort(unique(values), method = "radix")
+  more <- length(values) > 200L
+  values <- head(values, 200L)
+  paste0('{"names":', json_array(vapply(values, json_string, character(1L))), ',"more":', if (more) 'true' else 'false', '}')
+}
+
 # Keep an R graphics device alive across evaluations, so commands such as
 # points() and lines() can add to an existing plot. Render snapshots through a
 # second device; all generated files live in the supervisor's private directory.
@@ -224,6 +270,12 @@ rm(secret)
 repeat {
   request <- tryCatch(read_message(), error = function(e) NULL)
   if (is.null(request) || identical(request$kind, "SHUTDOWN")) break
+  if (identical(request$kind, "COMPLETE")) {
+    result <- tryCatch(completion_snapshot(request$payload), error = identity)
+    if (inherits(result, "error")) send_message("ERROR", request$id, conditionMessage(result))
+    else send_message("COMPLETIONS", request$id, result)
+    next
+  }
   if (identical(request$kind, "ENVIRONMENT")) {
     result <- tryCatch(environment_snapshot(), error = identity)
     if (inherits(result, "error")) send_message("ERROR", request$id, conditionMessage(result))

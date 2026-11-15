@@ -24,6 +24,7 @@ pub enum Event {
     Done(u64),
     PackageStatus(u64, String),
     Environment(u64, String),
+    Completions(u64, String),
     Plot { page: u64, png: Vec<u8> },
     PlotError(String),
     Incomplete(u64, String),
@@ -77,6 +78,12 @@ impl Session {
     }
     pub fn environment(&self, id: u64) -> Result<(), String> {
         self.send_package(id, "ENVIRONMENT", String::new())
+    }
+    pub fn complete(&self, id: u64, payload: String) -> Result<(), String> {
+        if payload.len() > 10_000 || payload.contains('\0') {
+            return Err("Completion request is too large.".into());
+        }
+        self.send_package(id, "COMPLETE", payload)
     }
     pub fn install_package(&self, id: u64, name: &str, bioconductor: bool) -> Result<(), String> {
         if !valid_name(name) {
@@ -491,6 +498,9 @@ fn connected_loop(
         }
         let request = if control.cancelled.load(Ordering::Acquire) {
             Ok(Request::Stop)
+        } else if matches!(pending, Some((_, "COMPLETE"))) {
+            // Keep foreground work queued until the current lookup finishes.
+            Err(TryRecvError::Empty)
         } else {
             requests.try_recv()
         };
@@ -541,7 +551,12 @@ fn connected_loop(
                     "ENVIRONMENT" if pending == Some((msg.id, "ENVIRONMENT")) => {
                         Event::Environment(msg.id, msg.payload)
                     }
-                    "DONE" if pending != Some((msg.id, "PACKAGES")) => Event::Done(msg.id),
+                    "COMPLETIONS" if pending == Some((msg.id, "COMPLETE")) => {
+                        Event::Completions(msg.id, msg.payload)
+                    }
+                    "DONE" if matches!(pending, Some((_, "EVAL" | "INSTALL" | "LOAD"))) => {
+                        Event::Done(msg.id)
+                    }
                     "INCOMPLETE" if pending == Some((msg.id, "EVAL")) => {
                         Event::Incomplete(msg.id, msg.payload)
                     }

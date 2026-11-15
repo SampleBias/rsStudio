@@ -72,6 +72,8 @@ while True:
  if kind == 'SHUTDOWN': break
  if kind == 'PACKAGES':
   send('STATUS',ident,'\n'.join(name + ('\t4.4.0\t1' if name == 'stats' else '\t-\t0') for name in value.split('\n'))); continue
+ if kind == 'COMPLETE':
+  time.sleep(0.2); send('COMPLETIONS',ident,'{"names":["mean"],"more":false}'); continue
  if kind in ('INSTALL','LOAD'):
   send('DONE',ident); continue
  if value == 'x <- 41': x=41
@@ -86,6 +88,53 @@ while True:
     .unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
     path
+}
+
+#[test]
+fn foreground_command_waits_for_completion_lookup() {
+    if !network_available() {
+        return;
+    }
+    let executable = fake_r();
+    let session = Session::start(executable.display().to_string(), std::env::temp_dir());
+    wait_for(&session, |e| matches!(e, Event::Ready { .. }));
+    session.complete(1, "symbols\t\t6d65".into()).unwrap();
+    session.evaluate(2, "x <- 41".into()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut completion_seen = false;
+    let mut done_seen = false;
+    while !done_seen {
+        for event in session.poll() {
+            match event {
+                Event::Completions(1, _) => completion_seen = true,
+                Event::Done(2) => {
+                    assert!(completion_seen);
+                    done_seen = true;
+                }
+                Event::Error(_, message) | Event::Failed(message) => {
+                    panic!("queued command failed: {message}")
+                }
+                _ => {}
+            }
+        }
+        assert!(Instant::now() < deadline, "queued command timed out");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    session.evaluate(3, "x + 1".into()).unwrap();
+    let (_, mut output) = wait_for(&session, |event| matches!(event, Event::Done(3)));
+    let end = Instant::now() + Duration::from_secs(2);
+    while !output.contains("42") && Instant::now() < end {
+        for event in session.poll() {
+            if let Event::Output(text) = event {
+                output.push_str(&text);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        output.contains("42"),
+        "queued assignment did not run: {output}"
+    );
 }
 
 #[test]
@@ -324,6 +373,67 @@ fn real_r_environment_reports_loaded_data_and_refreshes() {
         serde_json::from_str::<serde_json::Value>(&payload).unwrap(),
         serde_json::json!([])
     );
+}
+
+#[test]
+fn real_r_completion_uses_current_symbols_and_full_column_names() {
+    if !network_available() {
+        return;
+    }
+    if std::process::Command::new("R")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        assert!(
+            std::env::var_os("RSSTUDIO_REQUIRE_R").is_none(),
+            "R is required for this test"
+        );
+        return;
+    }
+    fn hex(s: &str) -> String {
+        s.as_bytes().iter().map(|b| format!("{b:02x}")).collect()
+    }
+    let session = Session::start("R".into(), std::env::temp_dir());
+    wait_for(&session, |e| matches!(e, Event::Ready { .. }));
+    session.evaluate(1, "data(airquality, package='datasets'); wide <- as.data.frame(setNames(as.list(1:30), c(paste0('col',1:29), 'π column')), check.names=FALSE); makeActiveBinding('danger', function() stop('must not run'), .GlobalEnv)".into()).unwrap();
+    let (event, _) = wait_for(&session, |e| {
+        matches!(e, Event::Done(1) | Event::Error(1, _))
+    });
+    if let Event::Error(_, message) = event {
+        panic!("setup: {message}");
+    }
+    let query = |id, mode: &str, owner: &str, prefix: &str| {
+        session
+            .complete(id, format!("{mode}\t{}\t{}", hex(owner), hex(prefix)))
+            .unwrap();
+        let (event, _) = wait_for(
+            &session,
+            |e| matches!(e, Event::Completions(event_id, _) | Event::Error(event_id, _) if *event_id == id),
+        );
+        if let Event::Error(_, ref message) = event {
+            panic!("completion {id}: {message}");
+        }
+        let Event::Completions(_, payload) = event else {
+            unreachable!()
+        };
+        serde_json::from_str::<serde_json::Value>(&payload).unwrap()["names"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(query(2, "members", "airquality", "Te"), vec!["Temp"]);
+    assert_eq!(query(3, "members", "wide", "π"), vec!["π column"]);
+    assert!(query(4, "symbols", "", "mea").contains(&"mean".to_owned()));
+    assert!(query(5, "namespace", "stats", "lm").contains(&"lm".to_owned()));
+    assert!(query(6, "members", "danger", "").is_empty());
+    session
+        .evaluate(7, "names(airquality)[4] <- 'Temperature'".into())
+        .unwrap();
+    wait_for(&session, |e| matches!(e, Event::Done(7)));
+    assert_eq!(query(8, "members", "airquality", "Te"), vec!["Temperature"]);
 }
 
 #[test]

@@ -35,13 +35,19 @@ File opening, saving, and directory listing run on a bounded background worker. 
 
 The editor uses a small built-in lexer for common R syntax; it is not a complete R parser. Font size and light/dark theme are saved under `$XDG_CONFIG_HOME/rsstudio/settings`, or `~/.config/rsstudio/settings` when `XDG_CONFIG_HOME` is unset. Preference writes are debounced while you adjust controls and flushed before quitting. Automatic Omarchy theme following is planned for a later phase.
 
+### Source completion
+
+The Source editor suggests names from the current R session while you type. Type a dataset name followed by `$` to see its columns, for example `airquality$Te` suggests `Temp`; `stats::` suggests exports from an already loaded namespace. Object and function names from the workspace and attached packages are also offered. Results appear after a short pause, with immediate requests after `$` or `::`. Use the arrow keys to select a suggestion, Tab or Enter to insert it, and Escape to dismiss the list. Tab indents when there is no completion. Completion edits support undo.
+
+Completion uses the active R session and does not require selecting an object in Environment or using the assistant. It sends names to the local editor, not to OpenRouter. Names are refreshed after R commands; while R is busy, previously cached names may be used. Looking up members of a lazily loaded R object may cause R to load it. Suggestions are limited to simple object names, list/data-frame members, matrix column names, and exports of loaded namespaces; complex expressions, function-argument inference, and pipeline-aware suggestions are not yet supported. Up to 100 results are displayed; type a longer prefix to narrow the list.
+
 ### Installing and loading R packages
 
 Open **Packages** in the lower-right workspace. The default list includes BiocManager, BiocVersion, DESeq2, and limma alongside common CRAN packages. BiocVersion records the Bioconductor release and is normally installed automatically by BiocManager. Once R is ready, the list shows installed versions and whether each package is attached. Click **Install** to download a package and its required dependencies; progress and errors appear in the Console. Click **Load** to attach an installed package to the current R session. Loading is separate from installation. Use **Refresh** to recheck status.
 
 To add another package, enter its name and select **Add**; choose **Bioconductor** first for a Bioconductor package. `stats` is bundled with R. CRAN packages use `https://cloud.r-project.org`; Bioconductor packages use `BiocManager`, which is installed from CRAN if needed. Installations use the first `R_LIBS_USER` directory, or an rsStudio user library if R does not define one. rsStudio creates the user library if necessary; it does not request administrator access. Large packages may take time and may need network access, compilers, or system libraries. Restarting R during installation can leave an incomplete install.
 
-Installing a package makes it available to R, but does not yet provide rsStudio support for every package's documentation, code completion, graphics, or interactive viewer. See the official [R package installation documentation](https://stat.ethz.ch/R-manual/R-devel/library/utils/html/install.packages.html) and [Bioconductor installation guidance](https://www.bioconductor.org/install/).
+Installing a package makes it available to R, but does not yet provide rsStudio support for every package's documentation, specialized completion, graphics, or interactive viewer. See the official [R package installation documentation](https://stat.ethz.ch/R-manual/R-devel/library/utils/html/install.packages.html) and [Bioconductor installation guidance](https://www.bioconductor.org/install/).
 
 ### R-gentic Assist
 

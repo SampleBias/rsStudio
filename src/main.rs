@@ -1,5 +1,6 @@
 mod agent;
 mod clipboard_image;
+mod completion;
 mod console;
 mod editor;
 mod file_worker;
@@ -89,6 +90,104 @@ fn import_command(path: &std::path::Path, name: &str) -> Result<String, String> 
     ))
 }
 
+fn inject_completion(ctx: &egui::Context, id: egui::Id, query: &completion::Query, text: String) {
+    let mut state = egui::TextEdit::load_state(ctx, id).unwrap_or_default();
+    state
+        .cursor
+        .set_char_range(Some(egui::text::CCursorRange::two(
+            egui::text::CCursor::new(query.start),
+            egui::text::CCursor::new(query.end),
+        )));
+    state.store(ctx, id);
+    ctx.input_mut(|input| input.events.push(egui::Event::Paste(text)));
+    ctx.memory_mut(|memory| memory.request_focus(id));
+}
+
+fn completion_keys(
+    ctx: &egui::Context,
+    completion: &mut completion::Completion,
+    can_wait: bool,
+) -> Option<(completion::Query, String)> {
+    if ctx.input(|input| input.modifiers != egui::Modifiers::NONE) {
+        return None;
+    }
+    let key = |key| ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, key));
+    if completion.visible {
+        if key(egui::Key::Escape) {
+            completion.dismiss();
+        } else if key(egui::Key::ArrowDown) {
+            completion.move_selection(1);
+        } else if key(egui::Key::ArrowUp) {
+            completion.move_selection(-1);
+        } else if key(egui::Key::Tab) || key(egui::Key::Enter) {
+            return completion.insertion();
+        }
+    } else if completion.manual_pending() && key(egui::Key::Escape) {
+        completion.dismiss();
+    } else if !completion.results.is_empty() && key(egui::Key::Tab) {
+        completion.open();
+        if completion.results.len() == 1 {
+            return completion.insertion();
+        }
+    } else if can_wait && completion.awaiting_lookup() && key(egui::Key::Tab) {
+        completion.request_now(Instant::now());
+    }
+    None
+}
+
+/// A character and Tab can arrive in the same UI frame. Let the editor apply
+/// the character first, then complete against the updated cursor and prefix.
+fn coalesced_completion_tab(ctx: &egui::Context) -> bool {
+    ctx.input(|input| {
+        if input.modifiers != egui::Modifiers::NONE {
+            return false;
+        }
+        let mut typed = false;
+        let mut tab = false;
+        for event in &input.events {
+            match event {
+                egui::Event::Text(text) | egui::Event::Ime(egui::ImeEvent::Commit(text)) => {
+                    if tab
+                        || text.is_empty()
+                        || !text
+                            .chars()
+                            .all(|c| c.is_alphanumeric() || c == '_' || c == '.')
+                    {
+                        return false;
+                    }
+                    typed = true;
+                }
+                egui::Event::Key {
+                    key: egui::Key::Tab,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if *modifiers == egui::Modifiers::NONE => tab = true,
+                egui::Event::Ime(egui::ImeEvent::Preedit(_))
+                | egui::Event::Cut
+                | egui::Event::Paste(_) => return false,
+                egui::Event::Key {
+                    key:
+                        egui::Key::Backspace
+                        | egui::Key::Delete
+                        | egui::Key::ArrowLeft
+                        | egui::Key::ArrowRight
+                        | egui::Key::Home
+                        | egui::Key::End
+                        | egui::Key::PageUp
+                        | egui::Key::PageDown,
+                    pressed: true,
+                    ..
+                } => {
+                    return false;
+                }
+                _ => {}
+            }
+        }
+        typed && tab
+    })
+}
+
 struct App {
     session: Option<Session>,
     assistant: agent::Agent,
@@ -109,6 +208,9 @@ struct App {
     preferences_pending: bool,
     deferred_exit: bool,
     source_cache: syntax::SourceCache,
+    completion: completion::Completion,
+    pending_completion: Option<(u64, completion::Key)>,
+    completion_insert: Option<(completion::Query, String)>,
     output_pending: String,
     project: PathBuf,
     project_entries: Vec<(PathBuf, bool)>,
@@ -178,6 +280,9 @@ impl App {
             preferences_pending: false,
             deferred_exit: false,
             source_cache: syntax::SourceCache::default(),
+            completion: completion::Completion::default(),
+            pending_completion: None,
+            completion_insert: None,
             output_pending: String::new(),
             project: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
             project_entries: Vec::new(),
@@ -226,6 +331,9 @@ impl App {
         self.session.take();
         self.plots.clear();
         self.pending_id = None;
+        self.pending_completion = None;
+        self.completion.clear();
+        self.completion_insert = None;
         self.pending_package = None;
         self.pending_environment = false;
         self.refresh_environment = true;
@@ -461,6 +569,27 @@ impl App {
             self.package_request(operation);
         }
     }
+    fn request_completion(&mut self, key: completion::Key) {
+        if self.state != State::Ready || self.pending_completion.is_some() {
+            return;
+        }
+        let id = self.next_id;
+        self.next_id = self.next_id.wrapping_add(1).max(1);
+        if let Some(session) = &self.session {
+            match session.complete(id, key.payload()) {
+                Ok(()) => {
+                    self.pending_completion = Some((id, key));
+                }
+                Err(_) => self.completion.receive(
+                    key,
+                    completion::Results {
+                        names: Vec::new(),
+                        more: false,
+                    },
+                ),
+            }
+        }
+    }
     fn request_environment(&mut self) {
         if self.state != State::Ready {
             return;
@@ -652,6 +781,7 @@ impl App {
                 Event::PlotError(error) => self.append(&format!("[Plot error] {error}\n")),
                 Event::Done(id) if self.pending_id == Some(id) => {
                     self.pending_id = None;
+                    self.completion.invalidate();
                     if let Some(operation) = self.pending_package.take() {
                         self.package_notice = match operation {
                             PackageOperation::Install(name) => {
@@ -698,6 +828,36 @@ impl App {
                         }
                     }
                 }
+                Event::Completions(id, payload)
+                    if self
+                        .pending_completion
+                        .as_ref()
+                        .is_some_and(|(pending, _)| *pending == id) =>
+                {
+                    if let Some((_, key)) = self.pending_completion.take() {
+                        let parsed = serde_json::from_str::<serde_json::Value>(&payload)
+                            .ok()
+                            .and_then(|v| {
+                                let names = v.get("names")?.as_array()?;
+                                if names.len() > 200 {
+                                    return None;
+                                }
+                                let names = names
+                                    .iter()
+                                    .map(|n| n.as_str().map(str::to_owned))
+                                    .collect::<Option<Vec<_>>>()?;
+                                Some(completion::Results {
+                                    names,
+                                    more: v.get("more")?.as_bool()?,
+                                })
+                            })
+                            .unwrap_or(completion::Results {
+                                names: Vec::new(),
+                                more: false,
+                            });
+                        self.completion.receive(key, parsed);
+                    }
+                }
                 Event::PackageStatus(id, payload)
                     if self.pending_id == Some(id)
                         && matches!(self.pending_package, Some(PackageOperation::Query)) =>
@@ -727,6 +887,22 @@ impl App {
                     self.submitted.clear();
                     self.state = State::Ready;
                 }
+                Event::Error(id, _)
+                    if self
+                        .pending_completion
+                        .as_ref()
+                        .is_some_and(|(pending, _)| *pending == id) =>
+                {
+                    if let Some((_, key)) = self.pending_completion.take() {
+                        self.completion.receive(
+                            key,
+                            completion::Results {
+                                names: Vec::new(),
+                                more: false,
+                            },
+                        );
+                    }
+                }
                 Event::Error(id, message) if self.pending_id == Some(id) => {
                     self.pending_id = None;
                     if self.pending_environment {
@@ -749,6 +925,7 @@ impl App {
                     self.append(&format!("Error: {message}\n"));
                     self.state = State::Ready;
                     self.refresh_environment = true;
+                    self.completion.invalidate();
                 }
                 Event::Failed(message) => {
                     if self.pending_id.take().is_some()
@@ -759,6 +936,8 @@ impl App {
                         self.input = std::mem::take(&mut self.submitted);
                     }
                     self.pending_package = None;
+                    self.pending_completion = None;
+                    self.completion.clear();
                     self.pending_environment = false;
                     self.environment.clear();
                     self.selected_environment.clear();
@@ -771,6 +950,8 @@ impl App {
                     self.state = State::Stopped;
                     self.environment.clear();
                     self.selected_environment.clear();
+                    self.pending_completion = None;
+                    self.completion.clear();
                 }
                 _ => {}
             }
@@ -789,6 +970,12 @@ impl eframe::App for App {
             && self.state == State::Ready
         {
             self.package_request(PackageOperation::Query);
+        }
+        if self.state == State::Ready
+            && !self.refresh_environment
+            && let Some(key) = self.completion.need_request(Instant::now())
+        {
+            self.request_completion(key);
         }
         self.assistant.poll();
         let paste_result = self
@@ -1309,8 +1496,84 @@ impl eframe::App for App {
             let dark = self.dark;
             let size = self.font_size;
             let cache = &mut self.source_cache;
+            let can_wait_for_completion = self.state == State::Ready
+                || self.pending_completion.is_some()
+                || self.pending_environment;
             let buffer = self.editor.current_mut();
             let id = egui::Id::new(("source_editor", buffer.id));
+            let completion = &mut self.completion;
+            let pending_insert = &mut self.completion_insert;
+            let menu_rect = ctx.memory(|memory| memory.area_rect(id.with("completion_menu")));
+            let menu_interaction = completion.visible
+                && ctx.input(|input| {
+                    (input.pointer.any_down() || input.pointer.any_released())
+                        && input
+                            .pointer
+                            .hover_pos()
+                            .is_some_and(|pos| menu_rect.is_some_and(|rect| rect.contains(pos)))
+                });
+            let before = completion.analyze(&buffer.text, buffer.id, buffer.cursor);
+            let focused = ctx.memory(|memory| memory.has_focus(id));
+            let defer_tab = focused
+                && completion.visible
+                && before.as_ref() == completion.query.as_ref()
+                && coalesced_completion_tab(ctx)
+                && ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Tab));
+            let input_changes_context = ctx.input(|input| {
+                input.events.iter().any(|event| match event {
+                    egui::Event::Text(_)
+                    | egui::Event::Paste(_)
+                    | egui::Event::Cut
+                    | egui::Event::Ime(egui::ImeEvent::Preedit(_) | egui::ImeEvent::Commit(_)) => {
+                        true
+                    }
+                    egui::Event::Key {
+                        key, pressed: true, ..
+                    } => matches!(
+                        key,
+                        egui::Key::Backspace
+                            | egui::Key::Delete
+                            | egui::Key::ArrowLeft
+                            | egui::Key::ArrowRight
+                            | egui::Key::Home
+                            | egui::Key::End
+                            | egui::Key::PageUp
+                            | egui::Key::PageDown
+                    ),
+                    _ => false,
+                })
+            });
+            let matches = focused
+                && !input_changes_context
+                && before.as_ref() == completion.query.as_ref()
+                && before.is_some();
+            // Let any text or IME update finish before applying a mouse or
+            // deferred selection; the next frame rechecks the cursor context.
+            let mut insert = if input_changes_context {
+                None
+            } else {
+                pending_insert.take()
+            };
+            if matches
+                && let Some(selected) = completion_keys(ctx, completion, can_wait_for_completion)
+            {
+                insert = Some(selected);
+            }
+            if matches && insert.is_none() {
+                insert = completion.manual_result();
+            }
+            let mut inserted = false;
+            if let Some((query, text)) = insert
+                && before.as_ref() == Some(&query)
+            {
+                let mut replacement = query;
+                if text == "\t" {
+                    replacement.start = replacement.cursor;
+                    replacement.end = replacement.cursor;
+                }
+                inject_completion(ctx, id, &replacement, text);
+                inserted = true;
+            }
             let mut run = false;
             egui::ScrollArea::both()
                 .id_salt("source_scroll")
@@ -1336,6 +1599,81 @@ impl eframe::App for App {
                             .show(ui);
                         if let Some(range) = response.cursor_range {
                             buffer.cursor = (range.primary.index, range.secondary.index);
+                        }
+                        if menu_interaction && !response.response.has_focus() {
+                            ctx.memory_mut(|memory| memory.request_focus(id));
+                        }
+                        let has_focus = response.response.has_focus() || menu_interaction;
+                        let active = has_focus
+                            .then(|| completion.analyze(&buffer.text, buffer.id, buffer.cursor))
+                            .flatten();
+                        completion.observe(active, Instant::now());
+                        if defer_tab && let Some(query) = completion.query.clone() {
+                            if !completion.results.is_empty() {
+                                *pending_insert = completion.insertion();
+                            } else if can_wait_for_completion {
+                                completion.request_now(Instant::now());
+                            } else {
+                                *pending_insert = Some((query, "\t".into()));
+                            }
+                        }
+                        if inserted {
+                            completion.dismiss();
+                        }
+                        if completion.visible && has_focus {
+                            let range = response.cursor_range.unwrap_or_else(|| {
+                                egui::text::CCursorRange::one(egui::text::CCursor::new(
+                                    buffer.cursor.0,
+                                ))
+                            });
+                            let caret = response
+                                .galley
+                                .pos_from_cursor(range.primary)
+                                .translate(response.galley_pos.to_vec2());
+                            let screen = ctx.content_rect();
+                            let x = caret
+                                .left()
+                                .clamp(screen.left(), (screen.right() - 230.0).max(screen.left()));
+                            let y = if caret.bottom() + 180.0 < screen.bottom() {
+                                caret.bottom()
+                            } else {
+                                (caret.top() - 180.0).max(screen.top())
+                            };
+                            egui::Area::new(id.with("completion_menu"))
+                                .order(egui::Order::Foreground)
+                                .fixed_pos(egui::pos2(x, y))
+                                .show(ctx, |ui| {
+                                    egui::Frame::popup(ui.style()).show(ui, |ui| {
+                                        ui.set_min_width(220.0);
+                                        egui::ScrollArea::vertical()
+                                            .max_height(180.0)
+                                            .id_salt("items")
+                                            .show(ui, |ui| {
+                                                for (index, name) in
+                                                    completion.results.iter().enumerate()
+                                                {
+                                                    let selected = index == completion.selected;
+                                                    let response =
+                                                        ui.selectable_label(selected, name);
+                                                    if selected {
+                                                        response.scroll_to_me(Some(
+                                                            egui::Align::Center,
+                                                        ));
+                                                    }
+                                                    if response.clicked() {
+                                                        completion.selected = index;
+                                                        *pending_insert = completion.insertion();
+                                                        ctx.memory_mut(|memory| {
+                                                            memory.request_focus(id)
+                                                        });
+                                                    }
+                                                }
+                                                if completion.results.len() == 100 {
+                                                    ui.weak("Type more to narrow the list.");
+                                                }
+                                            });
+                                    });
+                                });
                         }
                         run = response.response.has_focus()
                             && ctx.input(|i| i.modifiers.ctrl && i.key_pressed(egui::Key::Enter));
@@ -1544,5 +1882,442 @@ mod assistant_import_tests {
             },
         );
         assert_eq!(text, "hello");
+    }
+
+    #[test]
+    fn source_completion_replaces_token_and_can_be_undone() {
+        let ctx = egui::Context::default();
+        let id = egui::Id::new("completion-editor-test");
+        let mut text = "π <- airquality$Tempx".to_owned();
+        let caret = text.chars().count() - 1;
+        let query = completion::query(&text, 1, (caret, caret)).unwrap();
+        let _ = ctx.run(
+            egui::RawInput {
+                time: Some(1.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.add(egui::TextEdit::multiline(&mut text).id(id).code_editor())
+                        .request_focus();
+                });
+            },
+        );
+        let _ = ctx.run(
+            egui::RawInput {
+                time: Some(2.0),
+                ..Default::default()
+            },
+            |ctx| {
+                inject_completion(ctx, id, &query, "Temp".into());
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.add(egui::TextEdit::multiline(&mut text).id(id).code_editor());
+                });
+            },
+        );
+        assert_eq!(text, "π <- airquality$Temp");
+        let modifiers = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            ..Default::default()
+        };
+        let _ = ctx.run(
+            egui::RawInput {
+                time: Some(3.0),
+                modifiers,
+                events: vec![egui::Event::Key {
+                    key: egui::Key::Z,
+                    physical_key: Some(egui::Key::Z),
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                }],
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.add(egui::TextEdit::multiline(&mut text).id(id).code_editor());
+                });
+            },
+        );
+        assert_eq!(text, "π <- airquality$Tempx");
+    }
+
+    #[test]
+    fn completion_keyboard_selects_results_and_leaves_indentation_alone() {
+        let ctx = egui::Context::default();
+        let mut completion = completion::Completion::default();
+        let query = completion::query("airquality$", 1, (11, 11)).unwrap();
+        completion.observe(Some(query.clone()), Instant::now());
+        completion.receive(
+            query.key.clone(),
+            completion::Results {
+                names: vec!["Temp".into(), "Wind".into()],
+                more: false,
+            },
+        );
+        let event = |key, modifiers| egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed: true,
+            repeat: false,
+            modifiers,
+        };
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![event(egui::Key::ArrowDown, egui::Modifiers::NONE)],
+                ..Default::default()
+            },
+            |ctx| {
+                assert!(completion_keys(ctx, &mut completion, true).is_none());
+            },
+        );
+        let mut selected = None;
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![event(egui::Key::Tab, egui::Modifiers::NONE)],
+                ..Default::default()
+            },
+            |ctx| {
+                selected = completion_keys(ctx, &mut completion, true);
+                assert!(!ctx.input(|i| i.key_pressed(egui::Key::Tab)));
+            },
+        );
+        assert_eq!(selected.unwrap().1, "Wind");
+        completion.receive(
+            query.key,
+            completion::Results {
+                names: Vec::new(),
+                more: false,
+            },
+        );
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![event(egui::Key::Tab, egui::Modifiers::NONE)],
+                ..Default::default()
+            },
+            |ctx| {
+                assert!(completion_keys(ctx, &mut completion, true).is_none());
+                assert!(ctx.input(|i| i.key_pressed(egui::Key::Tab)));
+            },
+        );
+        let query = completion::query("airquality$Te", 1, (13, 13)).unwrap();
+        completion.observe(Some(query.clone()), Instant::now());
+        completion.request_now(Instant::now());
+        completion.receive(
+            query.key,
+            completion::Results {
+                names: vec!["Temp".into()],
+                more: false,
+            },
+        );
+        let _ = ctx.run(
+            egui::RawInput {
+                events: vec![event(egui::Key::Escape, egui::Modifiers::NONE)],
+                ..Default::default()
+            },
+            |ctx| {
+                assert!(completion_keys(ctx, &mut completion, true).is_none());
+                assert!(completion.manual_result().is_none());
+            },
+        );
+    }
+
+    #[test]
+    fn source_dropdown_keyboard_completes_in_the_full_app() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(settings::Settings::default(), &ctx);
+        app.session.take();
+        app.state = State::Stopped;
+        app.refresh_environment = false;
+        app.show_assistant = false;
+        let buffer = app.editor.current_mut();
+        buffer.text = "airquality$".into();
+        let caret = buffer.text.chars().count();
+        buffer.cursor = (caret, caret);
+        let id = egui::Id::new(("source_editor", buffer.id));
+        let mut edit_state = egui::TextEdit::load_state(&ctx, id).unwrap_or_default();
+        edit_state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::one(
+                egui::text::CCursor::new(caret),
+            )));
+        edit_state.store(&ctx, id);
+        ctx.memory_mut(|memory| memory.request_focus(id));
+        let mut frame = eframe::Frame::_new_kittest();
+        let input = |events| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run(input(vec![]), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame)
+        });
+        let query = app
+            .completion
+            .query
+            .clone()
+            .expect("source editor has focus");
+        app.completion.receive(
+            query.key,
+            completion::Results {
+                names: vec!["Temp".into(), "Wind".into()],
+                more: false,
+            },
+        );
+        let event = |key| egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let _ = ctx.run(
+            input(vec![
+                egui::Event::Ime(egui::ImeEvent::Disabled),
+                event(egui::Key::ArrowDown),
+            ]),
+            |ctx| eframe::App::update(&mut app, ctx, &mut frame),
+        );
+        assert_eq!(
+            app.completion.selected, 1,
+            "arrow should select the next suggestion"
+        );
+        let _ = ctx.run(
+            input(vec![
+                egui::Event::Ime(egui::ImeEvent::Enabled),
+                event(egui::Key::Tab),
+            ]),
+            |ctx| eframe::App::update(&mut app, ctx, &mut frame),
+        );
+        assert_eq!(app.editor.current().text, "airquality$Wind");
+    }
+
+    #[test]
+    fn source_dropdown_completes_after_typing_and_tab_in_one_frame() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(settings::Settings::default(), &ctx);
+        app.session.take();
+        app.state = State::Stopped;
+        app.refresh_environment = false;
+        app.show_assistant = false;
+        let buffer = app.editor.current_mut();
+        buffer.text = "airquality$".into();
+        let caret = buffer.text.chars().count();
+        buffer.cursor = (caret, caret);
+        let id = egui::Id::new(("source_editor", buffer.id));
+        let mut edit_state = egui::TextEdit::load_state(&ctx, id).unwrap_or_default();
+        edit_state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::one(
+                egui::text::CCursor::new(caret),
+            )));
+        edit_state.store(&ctx, id);
+        ctx.memory_mut(|memory| memory.request_focus(id));
+        let mut frame = eframe::Frame::_new_kittest();
+        let input = |events| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run(input(vec![]), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame)
+        });
+        let query = app
+            .completion
+            .query
+            .clone()
+            .expect("source editor has focus");
+        app.completion.receive(
+            query.key,
+            completion::Results {
+                names: vec!["Temp".into(), "Wind".into()],
+                more: false,
+            },
+        );
+        let event = |key| egui::Event::Key {
+            key,
+            physical_key: Some(key),
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let _ = ctx.run(
+            input(vec![egui::Event::Text("T".into()), event(egui::Key::Tab)]),
+            |ctx| eframe::App::update(&mut app, ctx, &mut frame),
+        );
+        let _ = ctx.run(input(vec![]), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame)
+        });
+        assert_eq!(app.editor.current().text, "airquality$Temp");
+    }
+
+    #[test]
+    fn source_dropdown_mouse_click_selects_a_suggestion() {
+        let ctx = egui::Context::default();
+        let mut app = App::new(settings::Settings::default(), &ctx);
+        app.session.take();
+        app.state = State::Stopped;
+        app.refresh_environment = false;
+        app.show_assistant = false;
+        let buffer = app.editor.current_mut();
+        buffer.text = "airquality$".into();
+        let caret = buffer.text.chars().count();
+        buffer.cursor = (caret, caret);
+        let id = egui::Id::new(("source_editor", buffer.id));
+        let mut state = egui::TextEdit::load_state(&ctx, id).unwrap_or_default();
+        state
+            .cursor
+            .set_char_range(Some(egui::text::CCursorRange::one(
+                egui::text::CCursor::new(caret),
+            )));
+        state.store(&ctx, id);
+        ctx.memory_mut(|m| m.request_focus(id));
+        let mut frame = eframe::Frame::_new_kittest();
+        let input = |events| egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1280.0, 800.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let _ = ctx.run(input(vec![]), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame)
+        });
+        let query = app.completion.query.clone().unwrap();
+        app.completion.receive(
+            query.key,
+            completion::Results {
+                names: vec!["Temp".into(), "Wind".into()],
+                more: false,
+            },
+        );
+        let _ = ctx.run(input(vec![]), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame)
+        });
+        let rect = ctx
+            .memory(|m| m.area_rect(id.with("completion_menu")))
+            .expect("dropdown visible");
+        let position = rect.min + egui::vec2(30.0, 15.0);
+        let button = |pressed| egui::Event::PointerButton {
+            pos: position,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let _ = ctx.run(input(vec![egui::Event::PointerMoved(position)]), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame)
+        });
+        let _ = ctx.run(input(vec![button(true)]), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame)
+        });
+        let _ = ctx.run(input(vec![button(false)]), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame)
+        });
+        let _ = ctx.run(
+            input(vec![egui::Event::Ime(
+                egui::ImeEvent::Commit(String::new()),
+            )]),
+            |ctx| eframe::App::update(&mut app, ctx, &mut frame),
+        );
+        let _ = ctx.run(input(vec![]), |ctx| {
+            eframe::App::update(&mut app, ctx, &mut frame)
+        });
+        assert_eq!(app.editor.current().text, "airquality$Temp");
+    }
+
+    #[test]
+    fn completion_keeps_ready_status_and_preserves_queued_running_status() {
+        if std::net::TcpListener::bind("127.0.0.1:0").is_err() {
+            assert!(
+                std::env::var_os("RSSTUDIO_REQUIRE_R").is_none(),
+                "loopback is required for this test"
+            );
+            return;
+        }
+        if std::process::Command::new("R")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            assert!(
+                std::env::var_os("RSSTUDIO_REQUIRE_R").is_none(),
+                "R is required for this test"
+            );
+            return;
+        }
+        let ctx = egui::Context::default();
+        let mut app = App::new(settings::Settings::default(), &ctx);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while app.state == State::Starting {
+            app.poll(&ctx);
+            assert!(Instant::now() < deadline, "R startup timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(app.state == State::Ready);
+        for prefix in ["a", "ai", "a"] {
+            app.request_completion(completion::Key {
+                kind: completion::Kind::Symbol,
+                prefix: prefix.into(),
+            });
+            assert!(app.pending_completion.is_some());
+            while app.pending_completion.is_some() {
+                assert!(
+                    app.state == State::Ready,
+                    "editing lookups must remain Ready"
+                );
+                app.poll(&ctx);
+                assert!(
+                    app.state == State::Ready,
+                    "lookup completion must remain Ready"
+                );
+                assert!(Instant::now() < deadline, "editing lookup timed out");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        let key = completion::Key {
+            kind: completion::Kind::Symbol,
+            prefix: "mea".into(),
+        };
+        app.request_completion(key);
+        assert!(app.state == State::Ready, "a lookup must not show Running");
+        assert!(app.pending_completion.is_some());
+        assert!(app.pending_id.is_none());
+        assert!(app.submit_text("Sys.sleep(0.5); x <- 41".into(), false));
+        assert!(app.state == State::Busy);
+        while app.pending_completion.is_some() {
+            app.poll(&ctx);
+            assert!(Instant::now() < deadline, "completion timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            app.state == State::Busy,
+            "completion must not mark an active command Ready"
+        );
+        while app.pending_id.is_some() {
+            app.poll(&ctx);
+            assert!(Instant::now() < deadline, "queued command timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(app.state == State::Ready);
+        assert!(app.submit_text("stopifnot(x == 41)".into(), false));
+        while app.pending_id.is_some() {
+            app.poll(&ctx);
+            assert!(Instant::now() < deadline, "verification timed out");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(app.state == State::Ready);
+        assert!(
+            !app.output_pending.contains("Error:"),
+            "{}",
+            app.output_pending
+        );
     }
 }
